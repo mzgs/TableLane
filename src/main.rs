@@ -3,7 +3,7 @@ mod settings_view;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar,
+    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar, WindowExt,
     button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
     status_bar::StatusBar,
@@ -105,7 +105,19 @@ impl Render for AppView {
                             .id("sidebar")
                             .test_support()
                             .size_full()
-                            .bg(cx.theme().sidebar),
+                            .bg(cx.theme().sidebar)
+                            .p_2()
+                            .child(
+                                Button::new("add-connection")
+                                    .icon(IconName::Plus)
+                                    .label("Add connection…")
+                                    .w_full()
+                                    .on_click(|_, window, cx| {
+                                        window.open_dialog(cx, |dialog, _, _| {
+                                            dialog.title("Add connection")
+                                        });
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -316,8 +328,48 @@ fn main() {
 mod tests {
     use super::AppView;
     use gpui_kit::{
-        AppContext, TestAppContext, component::Root, point, px, size, test::TestWindowExt,
+        AppContext, TestAppContext,
+        component::{Root, WindowExt},
+        point, px, size,
+        test::TestWindowExt,
     };
+
+    #[gpui_kit::test]
+    fn add_connection_opens_and_dismisses_an_empty_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+            let button = window.find("add-connection").bounds();
+            let sidebar = window.find("sidebar").bounds();
+            assert!(button.top() >= sidebar.top());
+            assert!(button.bottom() < sidebar.center().y);
+            assert!(button.left() >= sidebar.left() && button.right() <= sidebar.right());
+            window.click("add-connection", cx);
+            assert!(window.has_active_dialog(cx));
+            assert!(window.find("dialog").visible());
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+            for _ in 0..5 {
+                if window.find("add-connection").focused() == Some(true) {
+                    break;
+                }
+                window.focus_next(cx);
+                window.render_frame(cx);
+            }
+            assert_eq!(window.find("add-connection").focused(), Some(true));
+            window.press("enter", cx);
+            assert!(window.has_active_dialog(cx));
+            window.within("dialog").click("close", cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn sidebar_resizes_by_dragging_its_divider(cx: &mut TestAppContext) {
