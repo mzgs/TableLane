@@ -1,4 +1,6 @@
 mod connection_dialog;
+mod connections;
+mod database;
 mod settings;
 mod settings_view;
 mod window_state;
@@ -14,7 +16,10 @@ use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
 
-gpui_kit::assets::icon_assets!(SettingsIcons, [Upload, Download, PanelBottom, PanelRight]);
+gpui_kit::assets::icon_assets!(
+    SettingsIcons,
+    [Upload, Download, PanelBottom, PanelRight, Database, Table]
+);
 
 struct Assets;
 
@@ -40,6 +45,7 @@ impl Global for Settings {}
 actions!(base_app, [Quit, OpenSettings]);
 
 struct AppView {
+    connections: Entity<connections::Connections>,
     sidebar_visible: bool,
     right_sidebar_visible: bool,
     bottom_bar_visible: bool,
@@ -74,6 +80,7 @@ impl AppView {
             true
         });
         Self {
+            connections: cx.new(connections::Connections::new),
             sidebar_visible: true,
             right_sidebar_visible: false,
             bottom_bar_visible: true,
@@ -109,6 +116,8 @@ impl Render for AppView {
                             .id("sidebar")
                             .test_support()
                             .size_full()
+                            .flex()
+                            .flex_col()
                             .bg(cx.theme().sidebar)
                             .p_2()
                             .child(
@@ -124,13 +133,7 @@ impl Render for AppView {
                                         );
                                     })),
                             )
-                            .children(cx.try_global::<Settings>().into_iter().flat_map(
-                                |settings| {
-                                    settings.connections.iter().map(|connection| {
-                                        div().px_2().py_1().text_sm().child(connection.name.clone())
-                                    })
-                                },
-                            )),
+                            .child(div().flex_1().min_h_0().child(self.connections.clone())),
                     ),
             )
             .child(
