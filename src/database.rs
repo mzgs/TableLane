@@ -1,11 +1,58 @@
 use crate::settings::{Connection, DatabaseKind};
-use sqlx::{AnyConnection, Connection as _, Row};
+use sqlx::{Connection as _, MySqlConnection, Row};
 use std::collections::BTreeMap;
 
 pub(crate) struct Session {
-    // shortcut: status reflects the last successful connection, add health checks when querying is introduced.
-    _connection: AnyConnection,
+    connection: async_std::sync::Mutex<MySqlConnection>,
     pub(crate) databases: BTreeMap<String, Vec<String>>,
+}
+
+#[non_exhaustive]
+pub(crate) struct TableRows {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Option<String>>>,
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+impl Session {
+    pub(crate) async fn read_table(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<TableRows, String> {
+        async_std::future::timeout(std::time::Duration::from_secs(15), async {
+            let mut connection = self.connection.lock().await;
+            let metadata = sqlx::query(
+                "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            ).bind(database).bind(table).fetch_all(&mut *connection).await?;
+            let mut columns = Vec::new();
+            let mut expressions = Vec::new();
+            for column in metadata {
+                let name: String = column.try_get(0)?;
+                let kind: String = column.try_get(1)?;
+                let quoted = quote_identifier(&name);
+                let expression = match kind.as_str() {
+                    "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit" | "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" | "geometrycollection" => format!("HEX({quoted})"),
+                    _ => format!("CAST({quoted} AS CHAR CHARACTER SET utf8mb4)"),
+                };
+                columns.push(name);
+                expressions.push(expression);
+            }
+            if columns.is_empty() {
+                return Err(sqlx::Error::Protocol("Table is unavailable or has no accessible columns.".into()));
+            }
+            // shortcut: preview is capped at 1,000 rows, add pagination when browsing beyond the preview is needed.
+            let query = format!("SELECT {} FROM {}.{} LIMIT 1000", expressions.join(", "), quote_identifier(database), quote_identifier(table));
+            let rows = sqlx::query(&query).fetch_all(&mut *connection).await?
+                .iter().map(|row| (0..columns.len()).map(|ix| row.try_get(ix)).collect())
+                .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
+            Ok::<_, sqlx::Error>(TableRows { columns, rows })
+        }).await.map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
+            .map_err(|error| format!("Couldn’t load table: {error}. Double-click the table to try again."))
+    }
 }
 
 fn connection_url(connection: &Connection) -> Result<url::Url, String> {
@@ -32,9 +79,8 @@ fn connection_url(connection: &Connection) -> Result<url::Url, String> {
 
 pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> {
     let url = connection_url(connection)?;
-    sqlx::any::install_default_drivers();
     async_std::future::timeout(std::time::Duration::from_secs(15), async {
-        let mut session = AnyConnection::connect(url.as_str()).await?;
+        let mut session = MySqlConnection::connect(url.as_str()).await?;
         let mut databases = BTreeMap::new();
         for row in sqlx::query("SHOW DATABASES").fetch_all(&mut session).await? {
             databases.insert(row.try_get::<String, _>(0)?, Vec::new());
@@ -47,7 +93,7 @@ pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> 
                 tables.push(row.try_get(1)?);
             }
         }
-        Ok::<_, sqlx::Error>(Session { _connection: session, databases })
+        Ok::<_, sqlx::Error>(Session { connection: async_std::sync::Mutex::new(session), databases })
     }).await.map_err(|_| "Connection timed out. Check the host and port, then try again.".to_owned())?
         .map_err(|error| format!("Couldn’t connect or load databases: {error}"))
 }
@@ -56,6 +102,12 @@ pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> 
 mod tests {
     use super::connection_url;
     use crate::settings::{Connection, DatabaseKind};
+
+    #[test]
+    fn identifiers_escape_backticks_and_keep_qualified_names_separate() {
+        assert_eq!(super::quote_identifier("a`b/table"), "`a``b/table`");
+        assert_eq!(super::quote_identifier("schema.table"), "`schema.table`");
+    }
 
     #[test]
     #[ignore = "requires a temporary MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
@@ -78,6 +130,81 @@ mod tests {
         let session = async_std::task::block_on(super::connect(&connection)).unwrap();
         assert_eq!(session.databases["tablelane_test"], vec!["widgets"]);
         assert!(session.databases["empty_db"].is_empty());
+        let rows =
+            async_std::task::block_on(session.read_table("tablelane_test", "widgets")).unwrap();
+        assert!(!rows.columns.is_empty());
+        assert!(
+            async_std::task::block_on(session.read_table("tablelane_test", "missing_table"))
+                .is_err()
+        );
+        async_std::task::block_on(async {
+            let mut connection = session.connection.lock().await;
+            for query in [
+                "CREATE DATABASE `preview``test`",
+                "CREATE TABLE `preview``test`.`types``/table` (`number` BIGINT UNSIGNED, `amount` DECIMAL(20,4), `date` DATETIME, `text``value` TEXT, `bytes` BLOB, `nullable` TEXT)",
+                "INSERT INTO `preview``test`.`types``/table` VALUES (18446744073709551615, 123456789.1234, '2026-10-09 12:34:56', 'hello 世界', X'00FF', NULL)",
+            ] {
+                sqlx::query(query).execute(&mut *connection).await.unwrap();
+            }
+            drop(connection);
+            let rows = session
+                .read_table("preview`test", "types`/table")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.columns,
+                [
+                    "number",
+                    "amount",
+                    "date",
+                    "text`value",
+                    "bytes",
+                    "nullable"
+                ]
+            );
+            assert_eq!(
+                rows.rows[0],
+                vec![
+                    Some("18446744073709551615".into()),
+                    Some("123456789.1234".into()),
+                    Some("2026-10-09 12:34:56".into()),
+                    Some("hello 世界".into()),
+                    Some("00FF".into()),
+                    None
+                ]
+            );
+            let mut connection = session.connection.lock().await;
+            for _ in 0..10 {
+                sqlx::query("INSERT INTO `preview``test`.`types``/table` SELECT * FROM `preview``test`.`types``/table`").execute(&mut *connection).await.unwrap();
+            }
+            drop(connection);
+            assert_eq!(
+                session
+                    .read_table("preview`test", "types`/table")
+                    .await
+                    .unwrap()
+                    .rows
+                    .len(),
+                1000
+            );
+            let mut connection = session.connection.lock().await;
+            sqlx::query("TRUNCATE TABLE `preview``test`.`types``/table`")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            drop(connection);
+            let empty = session
+                .read_table("preview`test", "types`/table")
+                .await
+                .unwrap();
+            assert_eq!(empty.columns.len(), 6);
+            assert!(empty.rows.is_empty());
+            let mut connection = session.connection.lock().await;
+            sqlx::query("DROP DATABASE `preview``test`")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        });
         connection.password = "incorrect".into();
         assert!(async_std::task::block_on(super::connect(&connection)).is_err());
     }

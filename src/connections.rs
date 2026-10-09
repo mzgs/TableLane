@@ -16,7 +16,7 @@ struct Entry {
     config: Connection,
     item: TreeItem,
     loading: bool,
-    session: Option<database::Session>,
+    session: Option<std::sync::Arc<database::Session>>,
     error: Option<String>,
 }
 
@@ -25,6 +25,17 @@ pub(crate) struct Connections {
     tree: Entity<TreeState>,
     next_id: u64,
 }
+
+#[non_exhaustive]
+#[derive(Clone)]
+pub(crate) struct OpenTable {
+    pub(crate) session: std::sync::Arc<database::Session>,
+    pub(crate) connection_name: String,
+    pub(crate) database: String,
+    pub(crate) table: String,
+}
+
+impl EventEmitter<OpenTable> for Connections {}
 
 impl Connections {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
@@ -88,6 +99,28 @@ impl Connections {
         cx.notify();
     }
 
+    fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
+        for entry in &self.entries {
+            for database in &entry.item.children {
+                if let Some(table) = database
+                    .children
+                    .iter()
+                    .find(|table| table.id == *id && !table.is_disabled())
+                    && let Some(session) = &entry.session
+                {
+                    cx.emit(OpenTable {
+                        session: session.clone(),
+                        connection_name: entry.config.name.clone(),
+                        database: database.label.to_string(),
+                        table: table.label.to_string(),
+                    });
+                    return;
+                }
+            }
+        }
+        self.connect(id, cx);
+    }
+
     fn connect(&mut self, id: &SharedString, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.item.id == *id) else {
             return;
@@ -137,7 +170,7 @@ impl Connections {
                     })
                     .collect();
                 entry.item.clone().expanded(true);
-                entry.session = Some(session);
+                entry.session = Some(std::sync::Arc::new(session));
                 entry.error = None;
             }
             Err(error) => entry.error = Some(error),
@@ -192,7 +225,7 @@ impl Render for Connections {
                         .selected_item()
                         .map(|item| item.id.clone());
                     if let Some(id) = selected {
-                        view.connect(&id, cx);
+                        view.activate(&id, cx);
                     }
                 }),
             )
@@ -260,7 +293,7 @@ impl Render for Connections {
                             })
                             .on_click(move |event, _, cx| {
                                 if event.click_count() == 2 || event.is_keyboard() {
-                                    let _ = view.update(cx, |view, cx| view.connect(&id, cx));
+                                    let _ = view.update(cx, |view, cx| view.activate(&id, cx));
                                 }
                             })
                     })),

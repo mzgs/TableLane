@@ -3,6 +3,7 @@ mod connections;
 mod database;
 mod settings;
 mod settings_view;
+mod table_view;
 mod window_state;
 
 use gpui_kit::component::{
@@ -46,6 +47,7 @@ actions!(base_app, [Quit, OpenSettings]);
 
 struct AppView {
     connections: Entity<connections::Connections>,
+    table: Option<Entity<table_view::TableView>>,
     sidebar_visible: bool,
     right_sidebar_visible: bool,
     bottom_bar_visible: bool,
@@ -79,8 +81,20 @@ impl AppView {
             });
             true
         });
+        let connections = cx.new(connections::Connections::new);
+        cx.subscribe_in(
+            &connections,
+            window,
+            |view, _, event: &connections::OpenTable, window, cx| {
+                view.table =
+                    Some(cx.new(|cx| table_view::TableView::new(event.clone(), window, cx)));
+                cx.notify();
+            },
+        )
+        .detach();
         Self {
-            connections: cx.new(connections::Connections::new),
+            connections,
+            table: None,
             sidebar_visible: true,
             right_sidebar_visible: false,
             bottom_bar_visible: true,
@@ -142,7 +156,12 @@ impl Render for AppView {
                         .id("content")
                         .test_support()
                         .size_full()
-                        .bg(cx.theme().background),
+                        .min_w_0()
+                        .min_h_0()
+                        .bg(cx.theme().background)
+                        .when_some(self.table.as_ref(), |content, table| {
+                            content.child(table.clone())
+                        }),
                 ),
             );
         let workspace = workspace.child(
@@ -349,6 +368,115 @@ mod tests {
         point, px, size,
         test::TestWindowExt,
     };
+
+    #[gpui_kit::test]
+    #[ignore = "requires a temporary MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    fn mariadb_table_double_click_and_enter_open_content(cx: &mut TestAppContext) {
+        use crate::settings::{Connection, DatabaseKind, Settings};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings {
+                connections: vec![Connection {
+                    name: "Local".into(),
+                    database_type: DatabaseKind::MariaDB,
+                    host: "127.0.0.1".into(),
+                    port: Some(
+                        std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                            .unwrap()
+                            .parse()
+                            .unwrap(),
+                    ),
+                    username: "root".into(),
+                    password: String::new(),
+                    database: String::new(),
+                    file_path: String::new(),
+                }],
+                ..Settings::default()
+            });
+        });
+        let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.double_click("connection-1", cx)
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            let ready = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    window.render_frame(cx);
+                    window.try_find("connection-1-connected").is_some()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connection never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let table = "connection-1/database/tablelane_test/table/widgets";
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("connection-1/database/tablelane_test", cx);
+            window.click(table, cx);
+            assert!(window.try_find("table-title").is_none());
+            window.double_click(table, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / tablelane_test / widgets")
+            );
+        })
+        .unwrap();
+        loop {
+            cx.run_until_parked();
+            let ready = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    window.render_frame(cx);
+                    window.try_find("table").is_some()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "table never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            let content = window.find("content").bounds();
+            let grid = window.find("table").bounds();
+            assert!(grid.top() > content.top());
+            assert!(grid.bottom() <= content.bottom());
+            assert!(
+                window
+                    .find("table-status")
+                    .label()
+                    .unwrap()
+                    .contains("rows shown")
+            );
+            window.click(table, cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / tablelane_test / widgets")
+            );
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     fn add_connection_selects_databases_and_dismisses_dialog(cx: &mut TestAppContext) {
