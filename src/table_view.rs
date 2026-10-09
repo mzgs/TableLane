@@ -1,7 +1,7 @@
 use crate::{connections::OpenTable, database::TableRows};
 use gpui_kit::{
     component::{
-        ActiveTheme, Sizable, Size,
+        ActiveTheme, Sizable,
         table::{Column, DataTable, TableDelegate, TableState},
         tooltip::Tooltip,
     },
@@ -42,6 +42,9 @@ impl TableDelegate for Rows {
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .flex()
             .flex_col()
+            .size_full()
+            .justify_center()
+            .px_1p5()
             .gap_0p5()
             .min_w_0()
             .overflow_hidden()
@@ -79,6 +82,12 @@ impl TableDelegate for Rows {
         let value = &self.rows[row_ix][col_ix];
         div()
             .truncate()
+            .size_full()
+            .flex()
+            .items_center()
+            .px_1p5()
+            .border_r_1()
+            .border_color(cx.theme().table_row_border)
             .when(value.is_none(), |cell| {
                 cell.text_color(cx.theme().muted_foreground)
             })
@@ -143,11 +152,7 @@ impl TableView {
                         .map(|name| {
                             Column::new(name.clone(), name)
                                 .width(rems(12.).to_pixels(window.rem_size()))
-                                .paddings(Edges {
-                                    top: rems(0.25).to_pixels(window.rem_size()),
-                                    bottom: rems(0.25).to_pixels(window.rem_size()),
-                                    ..Size::Large.table_cell_padding()
-                                })
+                                .p_0()
                                 .movable(false)
                         })
                         .collect(),
@@ -170,14 +175,11 @@ impl TableView {
 impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if let Some(error) = &self.error {
-            error.clone()
-        } else if let Some(table) = &self.table {
-            format!(
-                "{} rows shown · Limit 1,000 · Long values shortened · Binary as hex",
-                table.read(cx).delegate().rows.len()
-            )
+            Some(error.clone())
+        } else if self.table.is_none() {
+            Some("Loading table…".to_owned())
         } else {
-            "Loading table…".into()
+            None
         };
         div()
             .flex()
@@ -213,30 +215,33 @@ impl Render for TableView {
                             .child(self.location.clone()),
                     ),
             )
-            .child(
-                div()
-                    .id("table-status")
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_label(status.clone())
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .text_sm()
-                    .text_color(if self.error.is_some() {
-                        cx.theme().danger
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(status),
-            )
+            .when_some(status, |view, status| {
+                view.child(
+                    div()
+                        .id("table-status")
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(status.clone())
+                        .px_3()
+                        .py_2()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(if self.error.is_some() {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
+                        .child(status),
+                )
+            })
             .when_some(self.table.as_ref(), |view, table| {
                 view.child(
                     div()
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
-                        .child(DataTable::new(table).large().bordered(false).stripe(true)),
+                        .pl_3()
+                        .child(DataTable::new(table).small().bordered(false).stripe(true)),
                 )
             })
     }
@@ -247,7 +252,9 @@ mod tests {
     use super::TableView;
     use crate::database::TableRows;
     use gpui_kit::{
-        AppContext, Focusable, ScrollDelta, TestAppContext, component::Root, point, px, size,
+        AppContext, Focusable, ScrollDelta, TestAppContext,
+        component::{Root, Size},
+        point, px, size,
         test::TestWindowExt,
     };
 
@@ -284,13 +291,7 @@ mod tests {
             });
             window.render_frame(cx);
             window.render_frame(cx);
-            assert!(
-                window
-                    .find("table-status")
-                    .label()
-                    .unwrap()
-                    .starts_with("1000 rows shown")
-            );
+            assert!(window.try_find("table-status").is_none());
             assert!(window.find("table").visible());
             assert_eq!(
                 window.find("table-title").label(),
@@ -308,9 +309,10 @@ mod tests {
             let kind = window.find("column-type-id").bounds();
             let header = window.find(("col-header", 0_usize)).bounds();
             let grid = window.find("table").bounds();
-            assert_eq!(grid.left(), px(0.));
+            assert_eq!(grid.left(), window.rem_size() * 0.75);
             assert_eq!(grid.right(), px(800.));
             assert_eq!(header.left(), grid.left());
+            assert!(header.size.height <= Size::Small.table_row_height());
             assert_eq!(name.left(), kind.left());
             assert!(kind.top() >= name.bottom());
             assert!(name.top() >= header.top());
@@ -323,6 +325,16 @@ mod tests {
             assert!(table.read(cx).selected_row().is_some());
             window.scroll("table", ScrollDelta::Pixels(point(px(0.), px(-1000.))), cx);
             assert!(table.read(cx).visible_range().rows().start > 0);
+            assert_eq!(window.find(("col-header", 0_usize)).bounds(), header);
+            assert_eq!(window.find("column-name-id").bounds(), name);
+            assert_eq!(window.find("column-type-id").bounds(), kind);
+            let title = window.find("table-title").bounds();
+            window.scroll("table", ScrollDelta::Pixels(point(px(0.), px(-30000.))), cx);
+            assert!(table.read(cx).visible_range().rows().end >= 1000);
+            assert_eq!(window.find(("col-header", 0_usize)).bounds(), header);
+            assert_eq!(window.find("column-name-id").bounds(), name);
+            assert_eq!(window.find("column-type-id").bounds(), kind);
+            assert_eq!(window.find("table-title").bounds(), title);
             view.update(cx, |view, cx| {
                 view.finish(
                     Ok(TableRows {
@@ -335,13 +347,7 @@ mod tests {
                 )
             });
             window.render_frame(cx);
-            assert!(
-                window
-                    .find("table-status")
-                    .label()
-                    .unwrap()
-                    .starts_with("0 rows shown")
-            );
+            assert!(window.try_find("table-status").is_none());
             view.update(cx, |view, cx| {
                 view.table = None;
                 view.finish(Err("Couldn’t load table".into()), window, cx);

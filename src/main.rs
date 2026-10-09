@@ -455,16 +455,10 @@ mod tests {
             let content = window.find("content").bounds();
             let grid = window.find("table").bounds();
             assert!(grid.top() > content.top());
-            assert_eq!(grid.left(), content.left());
+            assert_eq!(grid.left(), content.left() + window.rem_size() * 0.75);
             assert_eq!(grid.right(), content.right());
             assert!(grid.bottom() <= content.bottom());
-            assert!(
-                window
-                    .find("table-status")
-                    .label()
-                    .unwrap()
-                    .contains("rows shown")
-            );
+            assert!(window.try_find("table-status").is_none());
             window.click(table, cx);
             window.press("enter", cx);
         })
