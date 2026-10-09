@@ -3,14 +3,17 @@ mod settings_view;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, Theme,
+    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar,
+    button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
+    status_bar::StatusBar,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
 
-gpui_kit::assets::icon_assets!(SettingsIcons, [Upload, Download]);
+gpui_kit::assets::icon_assets!(SettingsIcons, [Upload, Download, PanelBottom, PanelRight]);
 
 struct Assets;
 
@@ -36,6 +39,9 @@ impl Global for Settings {}
 actions!(base_app, [Quit, OpenSettings]);
 
 struct AppView {
+    sidebar_visible: bool,
+    right_sidebar_visible: bool,
+    bottom_bar_visible: bool,
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
 }
@@ -65,6 +71,9 @@ impl AppView {
             true
         });
         Self {
+            sidebar_visible: true,
+            right_sidebar_visible: false,
+            bottom_bar_visible: true,
             window_path,
             window_state,
         }
@@ -84,9 +93,10 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_resizable("workspace")
+        let workspace = h_resizable("workspace")
             .child(
                 resizable_panel()
+                    .visible(self.sidebar_visible)
                     .size(px(240.))
                     .size_range(px(160.)..px(400.))
                     .flex_none()
@@ -106,7 +116,102 @@ impl Render for AppView {
                         .size_full()
                         .bg(cx.theme().background),
                 ),
+            );
+        let workspace = workspace.child(
+            resizable_panel()
+                .visible(self.right_sidebar_visible)
+                .size(px(240.))
+                .size_range(px(160.)..px(400.))
+                .flex_none()
+                .child(
+                    div()
+                        .id("right-sidebar")
+                        .test_support()
+                        .size_full()
+                        .bg(cx.theme().sidebar),
+                ),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                TitleBar::new()
+                    .child(
+                        Button::new("toolbar-settings")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Settings)
+                            .accessibility_label("Settings…")
+                            .tooltip("Settings…")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, window, cx| {
+                                cx.stop_propagation();
+                                window.dispatch_action(Box::new(OpenSettings), cx);
+                            }),
+                    )
+                    .child(
+                        ButtonGroup::new("layout-controls")
+                            .small()
+                            .outline()
+                            .mr_2()
+                            .child(
+                                Button::new("toggle-sidebar")
+                                    .icon(IconName::PanelLeft)
+                                    .selected(self.sidebar_visible)
+                                    .accessibility_label("Toggle left sidebar")
+                                    .tooltip("Show or hide left sidebar")
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        view.sidebar_visible = !view.sidebar_visible;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-bottom-bar")
+                                    .icon(IconName::PanelBottom)
+                                    .selected(self.bottom_bar_visible)
+                                    .accessibility_label("Toggle bottom bar")
+                                    .tooltip("Show or hide bottom bar")
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        view.bottom_bar_visible = !view.bottom_bar_visible;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("toggle-right-sidebar")
+                                    .icon(IconName::PanelRight)
+                                    .selected(self.right_sidebar_visible)
+                                    .accessibility_label("Toggle right sidebar")
+                                    .tooltip("Show or hide right sidebar")
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        view.right_sidebar_visible = !view.right_sidebar_visible;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
+            .child(div().flex_1().min_h_0().child(workspace))
+            .when(self.bottom_bar_visible, |view| {
+                view.child(
+                    div()
+                        .id("bottom-bar")
+                        .test_support()
+                        .flex_none()
+                        .child(StatusBar::new().h(rems(1.5))),
+                )
+            })
     }
 }
 
@@ -166,11 +271,7 @@ fn main() {
 
         let options = WindowOptions {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(env!("CARGO_PKG_NAME").into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+            ..TitleBar::window_options()
         };
         let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
@@ -229,6 +330,10 @@ mod tests {
             window.render_frame(cx);
             window.render_frame(cx);
             let sidebar = window.find("sidebar").bounds();
+            let toolbar = window.find("title-bar").bounds();
+            assert_eq!(toolbar.top(), px(0.));
+            assert_eq!(toolbar.size.width, px(800.));
+            assert_eq!(sidebar.top(), toolbar.bottom());
             assert_eq!(sidebar.left(), px(0.));
             assert!((sidebar.size.width - px(240.)).abs() <= px(1.));
             let divider = point(sidebar.right(), sidebar.center().y);
@@ -243,6 +348,146 @@ mod tests {
             let divider = point(sidebar.right(), sidebar.center().y);
             window.drag(divider, point(px(0.), divider.y), cx);
             assert!(window.find("sidebar").bounds().size.width >= px(160.));
+            window.click("toggle-sidebar", cx);
+            assert!(window.try_find("sidebar").is_none());
+            assert_eq!(window.find("content").bounds().left(), px(0.));
+            window.click("toggle-sidebar", cx);
+            assert!(window.find("sidebar").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn layout_controls_toggle_bars_and_right_sidebar_resizes(cx: &mut TestAppContext) {
+        use gpui_kit::AssetSource;
+        for path in ["icons/panel-bottom.svg", "icons/panel-right.svg"] {
+            assert!(!super::Assets.load(path).unwrap().unwrap().is_empty());
+        }
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(window.try_find("right-sidebar").is_none());
+            let bottom = window.find("bottom-bar").bounds();
+            assert_eq!(bottom.bottom(), px(600.));
+            assert_eq!(bottom.size.width, px(1000.));
+            assert_eq!(window.find("content").bounds().bottom(), bottom.top());
+            let left = window.find("toggle-sidebar").bounds();
+            let bottom_toggle = window.find("toggle-bottom-bar").bounds();
+            let right = window.find("toggle-right-sidebar").bounds();
+            assert_eq!(left.top(), right.top());
+            assert_eq!(left.right(), bottom_toggle.left());
+            assert_eq!(bottom_toggle.right(), right.left());
+            assert!(right.right() > px(950.));
+
+            window.click("toggle-right-sidebar", cx);
+            let sidebar = window.find("right-sidebar").bounds();
+            assert!((sidebar.size.width - px(240.)).abs() <= px(1.));
+            assert_eq!(sidebar.right(), px(1000.));
+            assert_eq!(sidebar.bottom(), bottom.top());
+            let divider = point(sidebar.left(), sidebar.center().y);
+            window.drag(divider, divider - point(px(80.), px(0.)), cx);
+            let resized = window.find("right-sidebar").bounds();
+            assert!(resized.size.width > sidebar.size.width + px(60.));
+            assert!(window.find("content").bounds().right() <= resized.left());
+            let divider = point(resized.left(), resized.center().y);
+            window.drag(divider, divider - point(px(500.), px(0.)), cx);
+            assert!(window.find("right-sidebar").bounds().size.width <= px(400.));
+            let sidebar = window.find("right-sidebar").bounds();
+            let divider = point(sidebar.left(), sidebar.center().y);
+            window.drag(divider, point(px(1000.), divider.y), cx);
+            assert!(window.find("right-sidebar").bounds().size.width >= px(160.));
+            let width = window.find("right-sidebar").bounds().size.width;
+            window.click("toggle-right-sidebar", cx);
+            assert!(window.try_find("right-sidebar").is_none());
+            assert_eq!(window.find("content").bounds().right(), px(1000.));
+            for _ in 0..4 {
+                if window.find("toggle-right-sidebar").focused() == Some(true) {
+                    break;
+                }
+                window.focus_next(cx);
+                window.render_frame(cx);
+            }
+            assert_eq!(window.find("toggle-right-sidebar").focused(), Some(true));
+            window.press("enter", cx);
+            assert!(
+                window.try_find("right-sidebar").is_some(),
+                "keyboard did not reopen sidebar"
+            );
+            assert_eq!(window.find("right-sidebar").bounds().size.width, width);
+
+            window.click("toggle-bottom-bar", cx);
+            assert!(window.try_find("bottom-bar").is_none());
+            assert_eq!(window.find("content").bounds().bottom(), px(600.));
+            window.focus_prev(cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("toggle-bottom-bar").focused(), Some(true));
+            window.press("space", cx);
+            assert_eq!(window.find("bottom-bar").bounds(), bottom);
+            assert!(window.find("sidebar").visible());
+            assert!(window.find("right-sidebar").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn toolbar_double_clicks_do_not_bubble_to_window_chrome(cx: &mut TestAppContext) {
+        use gpui_kit::{
+            InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, TestSupportExt,
+            div,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct Chrome {
+            view: gpui_kit::Entity<AppView>,
+            double_clicks: Rc<Cell<usize>>,
+        }
+        impl gpui_kit::Render for Chrome {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                let double_clicks = self.double_clicks.clone();
+                div()
+                    .id("window-chrome")
+                    .test_support()
+                    .size_full()
+                    .on_click(move |_, _, _| {
+                        double_clicks.set(double_clicks.get() + 1);
+                    })
+                    .child(self.view.clone())
+            }
+        }
+        cx.update(gpui_kit::init);
+        let double_clicks = Rc::new(Cell::new(0));
+        let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let chrome = cx.new(|_| Chrome {
+                view,
+                double_clicks: double_clicks.clone(),
+            });
+            Root::new(chrome, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            for id in [
+                "toggle-sidebar",
+                "toggle-bottom-bar",
+                "toggle-right-sidebar",
+                "toolbar-settings",
+            ] {
+                window.double_click(id, cx);
+                assert_eq!(double_clicks.get(), 0, "{id} leaked a double click");
+            }
+            assert!(window.find("sidebar").visible());
+            assert!(window.find("bottom-bar").visible());
+            assert!(window.try_find("right-sidebar").is_none());
+            window.click("title-bar", cx);
+            assert_eq!(double_clicks.get(), 1);
         })
         .unwrap();
     }

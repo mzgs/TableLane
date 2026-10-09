@@ -480,7 +480,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(std::fs::read(&path).unwrap(), original);
         cx.update_window(handle.into(), |_, window, cx| {
-            window.dispatch_action(Box::new(OpenSettings), cx);
+            window.click("toolbar-settings", cx);
         })
         .unwrap();
         cx.run_until_parked();
