@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+mod password;
 use std::{
     fs,
     io::{self, Read, Write},
@@ -7,6 +8,78 @@ use std::{
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DatabaseKind {
+    MySQL,
+    MariaDB,
+    MongoDB,
+    SQLite,
+    PostgreSQL,
+}
+
+impl DatabaseKind {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::MySQL,
+        Self::MariaDB,
+        Self::MongoDB,
+        Self::SQLite,
+        Self::PostgreSQL,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::MySQL => "MySQL",
+            Self::MariaDB => "MariaDB",
+            Self::MongoDB => "MongoDB",
+            Self::SQLite => "SQLite",
+            Self::PostgreSQL => "PostgreSQL",
+        }
+    }
+
+    pub(crate) fn port(self) -> Option<u16> {
+        match self {
+            Self::MySQL | Self::MariaDB => Some(3306),
+            Self::MongoDB => Some(27017),
+            Self::PostgreSQL => Some(5432),
+            Self::SQLite => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Connection {
+    pub(crate) name: String,
+    pub(crate) database_type: DatabaseKind,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+    pub(crate) username: String,
+    #[serde(with = "password")]
+    pub(crate) password: String,
+    pub(crate) database: String,
+    pub(crate) file_path: String,
+}
+
+impl Connection {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.name.trim().is_empty() {
+            return Err("Enter a connection name.");
+        }
+        if self.database_type == DatabaseKind::SQLite {
+            if self.file_path.trim().is_empty() {
+                return Err("Enter a SQLite file path.");
+            }
+        } else {
+            if self.host.trim().is_empty() {
+                return Err("Enter a host.");
+            }
+            if self.port.is_none_or(|port| port == 0) {
+                return Err("Enter a port from 1 to 65535.");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
@@ -14,6 +87,7 @@ pub(crate) struct Settings {
     pub(crate) display_name: String,
     pub(crate) notifications_enabled: bool,
     pub(crate) recent_items_limit: u32,
+    pub(crate) connections: Vec<Connection>,
 }
 
 impl Default for Settings {
@@ -22,6 +96,7 @@ impl Default for Settings {
             display_name: "Guest".into(),
             notifications_enabled: true,
             recent_items_limit: 10,
+            connections: Vec::new(),
         }
     }
 }
@@ -46,11 +121,23 @@ impl Settings {
     }
 
     pub(crate) fn read(path: &Path) -> io::Result<Self> {
-        read_json(path)
+        let settings: Self = read_json(path)?;
+        settings.validate()?;
+        Ok(settings)
     }
 
     pub(crate) fn save(&self, path: &Path) -> io::Result<()> {
+        self.validate()?;
         write_json(path, self)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        for connection in &self.connections {
+            connection
+                .validate()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
+        Ok(())
     }
 }
 
@@ -141,7 +228,11 @@ mod tests {
                     ..Settings::default()
                 }
             );
-            for invalid in ["invalid JSON", r#"{"recent_items_limit":-1}"#] {
+            for invalid in [
+                "invalid JSON",
+                r#"{"connections":[{"name":"Bad","database_type":"MySQL","host":"localhost","port":0,"username":"","password":"","database":"","file_path":""}]}"#,
+                r#"{"recent_items_limit":-1}"#,
+            ] {
                 fs::write(&path, invalid)?;
                 assert!(Settings::load(&path).is_err());
                 assert_eq!(fs::read_to_string(&path)?, invalid);

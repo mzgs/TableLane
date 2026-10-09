@@ -43,12 +43,14 @@ struct AppView {
     sidebar_visible: bool,
     right_sidebar_visible: bool,
     bottom_bar_visible: bool,
+    settings_path: Option<std::path::PathBuf>,
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
 }
 
 impl AppView {
     fn new(
+        settings_path: Option<std::path::PathBuf>,
         window_path: Option<std::path::PathBuf>,
         restored: Option<WindowState>,
         window: &mut Window,
@@ -75,6 +77,7 @@ impl AppView {
             sidebar_visible: true,
             right_sidebar_visible: false,
             bottom_bar_visible: true,
+            settings_path,
             window_path,
             window_state,
         }
@@ -113,10 +116,21 @@ impl Render for AppView {
                                     .icon(IconName::Plus)
                                     .label("Add connection…")
                                     .w_full()
-                                    .on_click(|_, window, cx| {
-                                        connection_dialog::open(window, cx);
-                                    }),
-                            ),
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        connection_dialog::open(
+                                            view.settings_path.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .children(cx.try_global::<Settings>().into_iter().flat_map(
+                                |settings| {
+                                    settings.connections.iter().map(|connection| {
+                                        div().px_2().py_1().text_sm().child(connection.name.clone())
+                                    })
+                                },
+                            )),
                     ),
             )
             .child(
@@ -291,7 +305,7 @@ fn main() {
                     Theme::sync_system_appearance(Some(window), cx);
                 })
                 .detach();
-            cx.new(|cx| AppView::new(window_path, restored, window, cx))
+            cx.new(|cx| AppView::new(settings_path.clone(), window_path, restored, window, cx))
         })
         .expect("Failed to open app window");
         window_handle.set(Some(handle));
@@ -337,7 +351,7 @@ mod tests {
     fn add_connection_selects_databases_and_dismisses_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
             Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -395,7 +409,7 @@ mod tests {
     fn sidebar_resizes_by_dragging_its_divider(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
             Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -437,7 +451,7 @@ mod tests {
         }
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
             Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -538,7 +552,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let double_clicks = Rc::new(Cell::new(0));
         let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
             let chrome = cx.new(|_| Chrome {
                 view,
                 double_clicks: double_clicks.clone(),

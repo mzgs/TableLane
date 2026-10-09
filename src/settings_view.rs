@@ -83,6 +83,7 @@ struct SettingsForm {
     name: Entity<InputState>,
     limit: Entity<InputState>,
     enabled: bool,
+    connections: Vec<crate::settings::Connection>,
     error: Option<String>,
     transfer_busy: bool,
     status: Option<String>,
@@ -105,6 +106,7 @@ impl SettingsForm {
             name,
             limit,
             enabled: settings.notifications_enabled,
+            connections: settings.connections,
             error: None,
             transfer_busy: false,
             status: None,
@@ -130,6 +132,7 @@ impl SettingsForm {
                 display_name: self.name.read(cx).value().to_string(),
                 notifications_enabled: self.enabled,
                 recent_items_limit: limit,
+                connections: self.connections.clone(),
             };
             settings.save(&self.path).map_err(|error| {
                 format!(
@@ -208,6 +211,7 @@ impl SettingsForm {
                                 state.set_value(settings.recent_items_limit.to_string(), window, cx)
                             });
                             form.enabled = settings.notifications_enabled;
+                            form.connections = settings.connections;
                         }
                         form.status = Some(
                             if importing {
@@ -366,7 +370,7 @@ mod tests {
             cx.set_global(Settings::default());
         });
         let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
-            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            let view = cx.new(|cx| AppView::new(None, None, None, window, cx));
             Root::new(view, window, cx)
         });
         cx.update(|cx| {
@@ -435,6 +439,16 @@ mod tests {
             display_name: "Imported".into(),
             notifications_enabled: false,
             recent_items_limit: 5,
+            connections: vec![crate::settings::Connection {
+                name: "Imported SQLite".into(),
+                database_type: crate::settings::DatabaseKind::SQLite,
+                host: String::new(),
+                port: None,
+                username: String::new(),
+                password: String::new(),
+                database: String::new(),
+                file_path: "/tmp/imported.sqlite".into(),
+            }],
         };
         imported.save(&backup).unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
@@ -531,6 +545,7 @@ mod tests {
         assert_eq!(saved.display_name, "Ada");
         assert!(!saved.notifications_enabled);
         assert_eq!(saved.recent_items_limit, 3);
+        assert!(saved.connections.is_empty());
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("save").is_none());
