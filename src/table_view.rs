@@ -1,8 +1,9 @@
 use crate::{connections::OpenTable, database::TableRows};
 use gpui_kit::{
     component::{
-        ActiveTheme, Sizable,
+        ActiveTheme, Sizable, Size,
         table::{Column, DataTable, TableDelegate, TableState},
+        tooltip::Tooltip,
     },
     prelude::FluentBuilder,
     *,
@@ -10,6 +11,7 @@ use gpui_kit::{
 
 struct Rows {
     columns: Vec<Column>,
+    column_types: Vec<String>,
     rows: Vec<Vec<Option<String>>>,
 }
 
@@ -22,6 +24,49 @@ impl TableDelegate for Rows {
     }
     fn column(&self, ix: usize, _: &App) -> Column {
         self.columns[ix].clone()
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let column = &self.columns[col_ix];
+        let kind = &self.column_types[col_ix];
+        let label = format!("{} · {}", column.name, kind);
+        div()
+            .id(SharedString::from(format!("column-title-{}", column.key)))
+            .test_support()
+            .aria_label(label.clone())
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id(SharedString::from(format!("column-name-{}", column.key)))
+                    .test_support()
+                    .truncate()
+                    .text_sm()
+                    .line_height(relative(1.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(column.name.clone()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("column-type-{}", column.key)))
+                    .test_support()
+                    .truncate()
+                    .text_xs()
+                    .line_height(relative(1.))
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(kind.clone()),
+            )
     }
 
     fn render_td(
@@ -54,16 +99,15 @@ impl TableDelegate for Rows {
 
 pub(crate) struct TableView {
     title: String,
+    location: String,
     table: Option<Entity<TableState<Rows>>>,
     error: Option<String>,
 }
 
 impl TableView {
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let title = format!(
-            "{} / {} / {}",
-            request.connection_name, request.database, request.table
-        );
+        let title = request.table.clone();
+        let location = format!("{} / {}", request.connection_name, request.database);
         let task = cx.background_spawn(async move {
             async_std::task::block_on(
                 request
@@ -78,6 +122,7 @@ impl TableView {
         .detach();
         Self {
             title,
+            location,
             table: None,
             error: None,
         }
@@ -98,15 +143,22 @@ impl TableView {
                         .map(|name| {
                             Column::new(name.clone(), name)
                                 .width(rems(12.).to_pixels(window.rem_size()))
+                                .paddings(Edges {
+                                    top: rems(0.25).to_pixels(window.rem_size()),
+                                    bottom: rems(0.25).to_pixels(window.rem_size()),
+                                    ..Size::Large.table_cell_padding()
+                                })
                                 .movable(false)
                         })
                         .collect(),
                     rows: rows.rows,
+                    column_types: rows.column_types,
                 };
                 self.table = Some(cx.new(|cx| {
                     TableState::new(delegate, window, cx)
                         .col_movable(false)
                         .cell_selectable(true)
+                        .row_header(false)
                 }));
             }
             Err(error) => self.error = Some(error),
@@ -137,12 +189,29 @@ impl Render for TableView {
                 div()
                     .id("table-title")
                     .test_support()
-                    .aria_label(self.title.clone())
-                    .truncate()
-                    .p_2()
+                    .aria_label(format!("{} / {}", self.location, self.title))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .flex_shrink_0()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(self.title.clone()),
+                    .child(
+                        div()
+                            .truncate()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.location.clone()),
+                    ),
             )
             .child(
                 div()
@@ -150,7 +219,9 @@ impl Render for TableView {
                     .test_support()
                     .role(Role::Status)
                     .aria_label(status.clone())
-                    .p_2()
+                    .px_3()
+                    .py_2()
+                    .flex_shrink_0()
                     .text_sm()
                     .text_color(if self.error.is_some() {
                         cx.theme().danger
@@ -165,7 +236,7 @@ impl Render for TableView {
                         .flex_1()
                         .min_h_0()
                         .min_w_0()
-                        .child(DataTable::new(table).small().bordered(false).stripe(true)),
+                        .child(DataTable::new(table).large().bordered(false).stripe(true)),
                 )
             })
     }
@@ -186,7 +257,8 @@ mod tests {
         let mut view = None;
         let handle = cx.open_window(size(px(800.), px(500.)), |window, cx| {
             let entity = cx.new(|_| TableView {
-                title: "Local / test / widgets".into(),
+                title: "widgets".into(),
+                location: "Local / test".into(),
                 table: None,
                 error: None,
             });
@@ -201,6 +273,7 @@ mod tests {
                 view.finish(
                     Ok(TableRows {
                         columns: vec!["id".into(), "name".into()],
+                        column_types: vec!["bigint unsigned".into(), "varchar(255)".into()],
                         rows: (0..1000)
                             .map(|ix| vec![Some(ix.to_string()), None])
                             .collect(),
@@ -219,6 +292,29 @@ mod tests {
                     .starts_with("1000 rows shown")
             );
             assert!(window.find("table").visible());
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / test / widgets")
+            );
+            assert_eq!(
+                window.find("column-title-id").label(),
+                Some("id · bigint unsigned")
+            );
+            assert_eq!(
+                window.find("column-title-name").label(),
+                Some("name · varchar(255)")
+            );
+            let name = window.find("column-name-id").bounds();
+            let kind = window.find("column-type-id").bounds();
+            let header = window.find(("col-header", 0_usize)).bounds();
+            let grid = window.find("table").bounds();
+            assert_eq!(grid.left(), px(0.));
+            assert_eq!(grid.right(), px(800.));
+            assert_eq!(header.left(), grid.left());
+            assert_eq!(name.left(), kind.left());
+            assert!(kind.top() >= name.bottom());
+            assert!(name.top() >= header.top());
+            assert!(kind.bottom() <= header.bottom());
             assert!(window.find("table").bounds().bottom() <= px(500.));
             let table = view.read(cx).table.as_ref().unwrap().clone();
             assert!(table.read(cx).visible_range().rows().len() < 1000);
@@ -231,6 +327,7 @@ mod tests {
                 view.finish(
                     Ok(TableRows {
                         columns: vec!["id".into()],
+                        column_types: vec!["bigint unsigned".into()],
                         rows: vec![],
                     }),
                     window,

@@ -12,6 +12,7 @@ pub(crate) struct Session {
 #[non_exhaustive]
 pub(crate) struct TableRows {
     pub(crate) columns: Vec<String>,
+    pub(crate) column_types: Vec<String>,
     pub(crate) rows: Vec<Vec<Option<String>>>,
 }
 
@@ -36,9 +37,10 @@ impl Session {
         async_std::future::timeout(std::time::Duration::from_secs(15), async {
             let mut connection = self.connection.lock().await;
             let metadata = sqlx::query(
-                "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             ).bind(database).bind(table).fetch_all(&mut *connection).await?;
             let mut columns = Vec::new();
+            let mut column_types = Vec::new();
             let mut expressions = Vec::new();
             let text_limit = CELL_PREVIEW_CHARS + 1;
             let binary_limit = CELL_PREVIEW_CHARS / 2 + 1;
@@ -51,6 +53,7 @@ impl Session {
                     _ => format!("CAST(LEFT({quoted}, {text_limit}) AS CHAR CHARACTER SET utf8mb4)"),
                 };
                 columns.push(name);
+                column_types.push(column.try_get::<String, _>(2)?);
                 expressions.push(expression);
             }
             if columns.is_empty() {
@@ -61,7 +64,7 @@ impl Session {
             let rows = sqlx::query(&query).fetch_all(&mut *connection).await?
                 .iter().map(|row| (0..columns.len()).map(|ix| row.try_get::<Option<String>, _>(ix).map(|value| value.map(truncate_preview))).collect())
                 .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
-            Ok::<_, sqlx::Error>(TableRows { columns, rows })
+            Ok::<_, sqlx::Error>(TableRows { columns, column_types, rows })
         }).await.map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
             .map_err(|error| format!("Couldn’t load table: {error}. Double-click the table to try again."))
     }
@@ -200,6 +203,13 @@ mod tests {
                     None
                 ]
             );
+            assert!(rows.column_types[0].starts_with("bigint"));
+            assert!(rows.column_types[0].ends_with("unsigned"));
+            assert_eq!(rows.column_types[1], "decimal(20,4)");
+            assert_eq!(
+                &rows.column_types[2..],
+                ["datetime", "longtext", "longblob", "text"]
+            );
             let mut connection = session.connection.lock().await;
             sqlx::query("UPDATE `preview``test`.`types``/table` SET `text``value` = REPEAT('ع', 100000), `bytes` = REPEAT(X'FF', 100000)")
                 .execute(&mut *connection).await.unwrap();
@@ -238,6 +248,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(empty.columns.len(), 6);
+            assert_eq!(empty.column_types, rows.column_types);
             assert!(empty.rows.is_empty());
             let mut connection = session.connection.lock().await;
             sqlx::query("DROP DATABASE `preview``test`")

@@ -455,6 +455,8 @@ mod tests {
             let content = window.find("content").bounds();
             let grid = window.find("table").bounds();
             assert!(grid.top() > content.top());
+            assert_eq!(grid.left(), content.left());
+            assert_eq!(grid.right(), content.right());
             assert!(grid.bottom() <= content.bottom());
             assert!(
                 window
