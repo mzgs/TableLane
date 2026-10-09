@@ -6,7 +6,6 @@ use gpui_kit::{
     component::{
         ActiveTheme, Icon, Sizable, h_flex,
         list::ListItem,
-        tooltip::Tooltip,
         tree::{TreeItem, TreeState, tree},
     },
     prelude::FluentBuilder,
@@ -127,11 +126,14 @@ impl Connections {
                     .iter()
                     .map(|(name, tables)| {
                         let database_id = format!("{id}/database/{name}");
-                        TreeItem::new(database_id.clone(), name.clone()).children(
-                            tables.iter().map(|table| {
+                        TreeItem::new(database_id.clone(), name.clone())
+                            .children(tables.iter().map(|table| {
                                 TreeItem::new(format!("{database_id}/table/{table}"), table.clone())
-                            }),
-                        )
+                            }))
+                            .children(tables.is_empty().then(|| {
+                                TreeItem::new(format!("{database_id}/empty"), "No tables")
+                                    .disabled(true)
+                            }))
                     })
                     .collect();
                 entry.item.clone().expanded(true);
@@ -203,10 +205,10 @@ impl Render for Connections {
                         let item = entry.item();
                         let status = statuses.iter().find(|(id, ..)| *id == item.id);
                         let connected = status.is_some_and(|(_, connected, ..)| *connected);
-                        let tooltip = status
+                        let description = status
                             .map(|(_, _, text, _)| text.clone())
                             .unwrap_or_else(|| item.label.to_string());
-                        let icon = if entry.is_folder() {
+                        let icon = if entry.is_folder() || entry.depth() == 1 {
                             if entry.is_expanded() {
                                 IconName::ChevronDown
                             } else {
@@ -221,15 +223,12 @@ impl Render for Connections {
                         let view = view.clone();
                         let tree_state = tree_state.clone();
                         ListItem::new(item.id.clone())
-                            .accessibility_label(format!("{} · {}", item.label, tooltip))
+                            .accessibility_label(format!("{} · {}", item.label, description))
                             .w_full()
                             .h_8()
                             .px_2()
                             .pl(rems(0.5 + entry.depth() as f32))
                             .text_sm()
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(tooltip.clone()).build(window, cx)
-                            })
                             .child(
                                 h_flex()
                                     .w_full()
@@ -427,6 +426,20 @@ mod tests {
                 Some("Connected")
             );
             assert_eq!(window.find("connection-status").label(), Some("Connected"));
+            let empty = "connection-1/database/empty_db";
+            let empty_message = "connection-1/database/empty_db/empty";
+            assert!(window.try_find(empty_message).is_none());
+            window.click(empty, cx);
+            assert!(window.find(empty_message).visible());
+            assert!(
+                window
+                    .find(empty_message)
+                    .label()
+                    .unwrap()
+                    .contains("No tables")
+            );
+            window.click(empty, cx);
+            assert!(window.try_find(empty_message).is_none());
             let database = "connection-1/database/tablelane_test";
             assert!(window.find(database).visible());
             assert!(
