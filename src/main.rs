@@ -1,9 +1,10 @@
+mod connection_dialog;
 mod settings;
 mod settings_view;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar, WindowExt,
+    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar,
     button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
     status_bar::StatusBar,
@@ -113,9 +114,7 @@ impl Render for AppView {
                                     .label("Add connection…")
                                     .w_full()
                                     .on_click(|_, window, cx| {
-                                        window.open_dialog(cx, |dialog, _, _| {
-                                            dialog.title("Add connection")
-                                        });
+                                        connection_dialog::open(window, cx);
                                     }),
                             ),
                     ),
@@ -335,7 +334,7 @@ mod tests {
     };
 
     #[gpui_kit::test]
-    fn add_connection_opens_and_dismisses_an_empty_dialog(cx: &mut TestAppContext) {
+    fn add_connection_selects_databases_and_dismisses_dialog(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
             let view = cx.new(|cx| AppView::new(None, None, window, cx));
@@ -353,6 +352,15 @@ mod tests {
             window.click("add-connection", cx);
             assert!(window.has_active_dialog(cx));
             assert!(window.find("dialog").visible());
+            assert_eq!(window.find("MySQL").checked(), Some(true));
+            let list = window.find("database-list").bounds();
+            assert!(list.size.width < window.find("dialog").bounds().size.width / 2.);
+            for database in ["MariaDB", "MongoDB", "SQLite", "PostgreSQL", "MySQL"] {
+                assert!(window.find(database).visible());
+                window.click(database, cx);
+                assert_eq!(window.find(database).checked(), Some(true));
+            }
+            assert_eq!(window.find("PostgreSQL").checked(), Some(false));
             window.press("escape", cx);
             assert!(!window.has_active_dialog(cx));
             for _ in 0..5 {
@@ -365,6 +373,18 @@ mod tests {
             assert_eq!(window.find("add-connection").focused(), Some(true));
             window.press("enter", cx);
             assert!(window.has_active_dialog(cx));
+            assert_eq!(window.find("MySQL").checked(), Some(true));
+            for _ in 0..7 {
+                if window.find("SQLite").focused() == Some(true) {
+                    break;
+                }
+                window.focus_next(cx);
+                window.render_frame(cx);
+            }
+            assert_eq!(window.find("SQLite").focused(), Some(true));
+            window.press("space", cx);
+            assert_eq!(window.find("SQLite").checked(), Some(true));
+            assert_eq!(window.find("MySQL").checked(), Some(false));
             window.within("dialog").click("close", cx);
             assert!(!window.has_active_dialog(cx));
         })
