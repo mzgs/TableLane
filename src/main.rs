@@ -320,7 +320,7 @@ fn main() {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
             ..TitleBar::window_options()
         };
-        let (handle, _) = gpui_kit::open_window(options, cx, |window, cx| {
+        let (handle, _view) = gpui_kit::open_window(options, cx, |window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
             window
                 .observe_window_appearance(|window, cx| {
@@ -331,6 +331,11 @@ fn main() {
         })
         .expect("Failed to open app window");
         window_handle.set(Some(handle));
+        #[cfg(debug_assertions)]
+        _view.update(cx, |view, cx| {
+            view.connections
+                .update(cx, |connections, cx| connections.open_debug_table(cx));
+        });
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
@@ -368,6 +373,77 @@ mod tests {
         point, px, size,
         test::TestWindowExt,
     };
+
+    #[cfg(debug_assertions)]
+    #[gpui_kit::test]
+    #[ignore = "requires a temporary MariaDB server with apps.apps and TABLELANE_TEST_MARIADB_PORT"]
+    fn debug_startup_opens_apps_table(cx: &mut TestAppContext) {
+        use crate::settings::{Connection, DatabaseKind, Settings};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings {
+                connections: vec![Connection {
+                    name: "Local".into(),
+                    database_type: DatabaseKind::MariaDB,
+                    host: "127.0.0.1".into(),
+                    port: Some(
+                        std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                            .unwrap()
+                            .parse()
+                            .unwrap(),
+                    ),
+                    username: "root".into(),
+                    password: String::new(),
+                    database: String::new(),
+                    file_path: String::new(),
+                }],
+                ..Settings::default()
+            });
+        });
+        let mut view = None;
+        let handle = cx.open_window(size(px(1000.), px(600.)), |window, cx| {
+            let app = cx.new(|cx| AppView::new(None, None, None, window, cx));
+            view = Some(app.clone());
+            Root::new(app, window, cx)
+        });
+        cx.update(|cx| {
+            view.unwrap().update(cx, |view, cx| {
+                view.connections
+                    .update(cx, |connections, cx| connections.open_debug_table(cx));
+            });
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            let ready = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    window.render_frame(cx);
+                    window.try_find("table").is_some()
+                })
+                .unwrap();
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "debug table never loaded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / apps / apps")
+            );
+            assert!(
+                window
+                    .find("connection-1/database/apps/table/apps")
+                    .visible()
+            );
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     #[ignore = "requires a temporary MariaDB server and TABLELANE_TEST_MARIADB_PORT"]

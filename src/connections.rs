@@ -24,6 +24,8 @@ pub(crate) struct Connections {
     entries: Vec<Entry>,
     tree: Entity<TreeState>,
     next_id: u64,
+    #[cfg(debug_assertions)]
+    debug_startup_connection: Option<SharedString>,
 }
 
 #[non_exhaustive]
@@ -48,12 +50,31 @@ impl Connections {
             entries: Vec::new(),
             tree: cx.new(|cx| TreeState::new(cx)),
             next_id: 0,
+            #[cfg(debug_assertions)]
+            debug_startup_connection: None,
         };
         cx.observe(&view.tree, |_, _, cx| cx.notify()).detach();
         view.sync(cx);
         cx.observe_global::<Settings>(|view, cx| view.sync(cx))
             .detach();
         view
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn open_debug_table(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self
+            .entries
+            .iter()
+            .find(|entry| entry.config.database_type == crate::settings::DatabaseKind::MariaDB)
+            .map(|entry| entry.item.clone())
+        else {
+            return;
+        };
+        self.debug_startup_connection = Some(item.id.clone());
+        self.tree.update(cx, |state, cx| {
+            state.set_selected_item(Some(&item), cx);
+        });
+        self.connect(&item.id, cx);
     }
 
     fn sync(&mut self, cx: &mut Context<Self>) {
@@ -176,6 +197,23 @@ impl Connections {
             Err(error) => entry.error = Some(error),
         }
         self.update_tree(cx);
+        #[cfg(debug_assertions)]
+        if self.debug_startup_connection.as_ref() == Some(id) {
+            self.debug_startup_connection = None;
+            let table = self
+                .entries
+                .iter()
+                .find(|entry| entry.item.id == *id)
+                .and_then(|entry| entry.item.children.iter().find(|db| db.label == "apps"))
+                .and_then(|db| db.children.iter().find(|table| table.label == "apps"))
+                .cloned();
+            if let Some(table) = table {
+                self.tree.update(cx, |state, cx| {
+                    state.set_selected_item(Some(&table), cx);
+                });
+                self.activate(&table.id, cx);
+            }
+        }
     }
 }
 
