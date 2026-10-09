@@ -121,7 +121,7 @@ impl Render for TableView {
             error.clone()
         } else if let Some(table) = &self.table {
             format!(
-                "{} rows shown · Limit 1,000 · Binary values shown as hex",
+                "{} rows shown · Limit 1,000 · Long values shortened · Binary as hex",
                 table.read(cx).delegate().rows.len()
             )
         } else {

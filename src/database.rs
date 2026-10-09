@@ -2,6 +2,8 @@ use crate::settings::{Connection, DatabaseKind};
 use sqlx::{Connection as _, MySqlConnection, Row};
 use std::collections::BTreeMap;
 
+const CELL_PREVIEW_CHARS: usize = 200;
+
 pub(crate) struct Session {
     connection: async_std::sync::Mutex<MySqlConnection>,
     pub(crate) databases: BTreeMap<String, Vec<String>>,
@@ -17,6 +19,14 @@ fn quote_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+fn truncate_preview(mut value: String) -> String {
+    if let Some((end, _)) = value.char_indices().nth(CELL_PREVIEW_CHARS) {
+        value.truncate(end);
+        value.push('…');
+    }
+    value
+}
+
 impl Session {
     pub(crate) async fn read_table(
         &self,
@@ -30,13 +40,15 @@ impl Session {
             ).bind(database).bind(table).fetch_all(&mut *connection).await?;
             let mut columns = Vec::new();
             let mut expressions = Vec::new();
+            let text_limit = CELL_PREVIEW_CHARS + 1;
+            let binary_limit = CELL_PREVIEW_CHARS / 2 + 1;
             for column in metadata {
                 let name: String = column.try_get(0)?;
                 let kind: String = column.try_get(1)?;
                 let quoted = quote_identifier(&name);
                 let expression = match kind.as_str() {
-                    "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit" | "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" | "geometrycollection" => format!("HEX({quoted})"),
-                    _ => format!("CAST({quoted} AS CHAR CHARACTER SET utf8mb4)"),
+                    "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob" | "bit" | "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" | "geometrycollection" => format!("HEX(LEFT({quoted}, {binary_limit}))"),
+                    _ => format!("CAST(LEFT({quoted}, {text_limit}) AS CHAR CHARACTER SET utf8mb4)"),
                 };
                 columns.push(name);
                 expressions.push(expression);
@@ -47,7 +59,7 @@ impl Session {
             // shortcut: preview is capped at 1,000 rows, add pagination when browsing beyond the preview is needed.
             let query = format!("SELECT {} FROM {}.{} LIMIT 1000", expressions.join(", "), quote_identifier(database), quote_identifier(table));
             let rows = sqlx::query(&query).fetch_all(&mut *connection).await?
-                .iter().map(|row| (0..columns.len()).map(|ix| row.try_get(ix)).collect())
+                .iter().map(|row| (0..columns.len()).map(|ix| row.try_get::<Option<String>, _>(ix).map(|value| value.map(truncate_preview))).collect())
                 .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
             Ok::<_, sqlx::Error>(TableRows { columns, rows })
         }).await.map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
@@ -104,6 +116,21 @@ mod tests {
     use crate::settings::{Connection, DatabaseKind};
 
     #[test]
+    fn cell_previews_preserve_short_values_and_truncate_on_unicode_boundaries() {
+        for value in [String::new(), "Short text".into(), "ع".repeat(200)] {
+            assert_eq!(super::truncate_preview(value.clone()), value);
+        }
+        assert_eq!(
+            super::truncate_preview("ع".repeat(201)),
+            format!("{}…", "ع".repeat(200))
+        );
+        assert_eq!(
+            super::truncate_preview("FF".repeat(101)),
+            format!("{}…", "FF".repeat(100))
+        );
+    }
+
+    #[test]
     fn identifiers_escape_backticks_and_keep_qualified_names_separate() {
         assert_eq!(super::quote_identifier("a`b/table"), "`a``b/table`");
         assert_eq!(super::quote_identifier("schema.table"), "`schema.table`");
@@ -141,7 +168,7 @@ mod tests {
             let mut connection = session.connection.lock().await;
             for query in [
                 "CREATE DATABASE `preview``test`",
-                "CREATE TABLE `preview``test`.`types``/table` (`number` BIGINT UNSIGNED, `amount` DECIMAL(20,4), `date` DATETIME, `text``value` TEXT, `bytes` BLOB, `nullable` TEXT)",
+                "CREATE TABLE `preview``test`.`types``/table` (`number` BIGINT UNSIGNED, `amount` DECIMAL(20,4), `date` DATETIME, `text``value` LONGTEXT, `bytes` LONGBLOB, `nullable` TEXT)",
                 "INSERT INTO `preview``test`.`types``/table` VALUES (18446744073709551615, 123456789.1234, '2026-10-09 12:34:56', 'hello 世界', X'00FF', NULL)",
             ] {
                 sqlx::query(query).execute(&mut *connection).await.unwrap();
@@ -174,6 +201,19 @@ mod tests {
                 ]
             );
             let mut connection = session.connection.lock().await;
+            sqlx::query("UPDATE `preview``test`.`types``/table` SET `text``value` = REPEAT('ع', 100000), `bytes` = REPEAT(X'FF', 100000)")
+                .execute(&mut *connection).await.unwrap();
+            drop(connection);
+            let preview = session
+                .read_table("preview`test", "types`/table")
+                .await
+                .unwrap();
+            assert_eq!(preview.rows[0][3], Some(format!("{}…", "ع".repeat(200))));
+            assert_eq!(preview.rows[0][4], Some(format!("{}…", "FF".repeat(100))));
+            assert_eq!(preview.rows[0][5], None);
+            let mut connection = session.connection.lock().await;
+            sqlx::query("UPDATE `preview``test`.`types``/table` SET `text``value` = 'hello 世界', `bytes` = X'00FF'")
+                .execute(&mut *connection).await.unwrap();
             for _ in 0..10 {
                 sqlx::query("INSERT INTO `preview``test`.`types``/table` SELECT * FROM `preview``test`.`types``/table`").execute(&mut *connection).await.unwrap();
             }

@@ -5,6 +5,8 @@ Double-click a saved MariaDB connection in the left sidebar, or select it and pr
 
 Double-click a table, or select it and press Enter, to show its data in the content area. The readonly preview uses virtual scrolling and shows up to 1,000 rows, with resizable columns. NULL values are marked explicitly; binary values appear as hexadecimal text. Open another table to replace the preview, or reopen the current table to reload it.
 
+Cell previews fetch at most 200 text characters or 100 binary bytes, plus a small lookahead to detect truncation. Longer values end with `…`; full values remain in the database and are not loaded into the grid. Full-row inspection is not implemented yet.
+
 Live MariaDB tests require an isolated server containing `tablelane_test.widgets` and an empty `empty_db` database, with a passwordless `root` account. Run them with `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked mariadb_ -- --ignored`.
 
 Connection passwords are encrypted with AES-256-GCM in settings JSON and settings exports, using a fresh random nonce for each save. Older plaintext passwords still load and are encrypted on the next save.
