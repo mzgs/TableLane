@@ -10,7 +10,9 @@ use gpui_kit::component::{
     ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar,
     button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
+    scroll::ScrollableElement,
     status_bar::StatusBar,
+    table::TableEvent,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -64,6 +66,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.bind_keys([
+            KeyBinding::new("cmd-s", table_view::SaveRow, Some("TableWorkspace")),
+            KeyBinding::new("escape", table_view::CancelRow, Some("RowEditor")),
+        ]);
         let mut window_state = restored.unwrap_or_else(|| WindowState::capture(window));
         window_state.update(window);
         cx.observe_window_bounds(window, |view, window, _| view.window_state.update(window))
@@ -86,9 +92,15 @@ impl AppView {
             &connections,
             window,
             |view, _, event: &connections::OpenTable, window, cx| {
-                view.table =
-                    Some(cx.new(|cx| table_view::TableView::new(event.clone(), window, cx)));
-                cx.notify();
+                if let Some(table) = &view.table
+                    && !table.update(cx, |table, cx| table.prepare_to_close(cx))
+                {
+                    view.right_sidebar_visible = true;
+                    cx.notify();
+                    return;
+                }
+                let table = cx.new(|cx| table_view::TableView::new(event.clone(), window, cx));
+                view.set_table(table, cx);
             },
         )
         .detach();
@@ -113,6 +125,22 @@ impl AppView {
                 path.display()
             );
         }
+    }
+
+    fn set_table(&mut self, table: Entity<table_view::TableView>, cx: &mut Context<Self>) {
+        cx.observe(&table, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&table, |view, _, event: &TableEvent, cx| {
+            if matches!(
+                event,
+                TableEvent::SelectRow(_) | TableEvent::SelectCell(_, _)
+            ) {
+                view.right_sidebar_visible = true;
+            }
+            cx.notify();
+        })
+        .detach();
+        self.table = Some(table);
+        cx.notify();
     }
 }
 
@@ -174,14 +202,41 @@ impl Render for AppView {
                     div()
                         .id("right-sidebar")
                         .test_support()
+                        .key_context("RowEditor")
                         .size_full()
-                        .bg(cx.theme().sidebar),
+                        .bg(cx.theme().sidebar)
+                        .child(
+                            div()
+                                .size_full()
+                                .when_some(self.table.as_ref(), |sidebar, table| {
+                                    sidebar.child(table.read(cx).render_sidebar(cx))
+                                })
+                                .overflow_y_scrollbar(),
+                        ),
                 ),
         );
         div()
             .flex()
             .flex_col()
             .size_full()
+            .key_context("TableWorkspace")
+            .on_action(cx.listener(|view, _: &table_view::SaveRow, window, cx| {
+                if let Some(table) = &view.table {
+                    table.update(cx, |table, cx| table.save(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|view, _: &table_view::CancelRow, window, cx| {
+                if let Some(table) = &view.table {
+                    table.update(cx, |table, cx| table.cancel(window, cx));
+                }
+            }))
+            .on_action(
+                cx.listener(|view, _: &gpui_kit::component::input::Escape, window, cx| {
+                    if let Some(table) = &view.table {
+                        table.update(cx, |table, cx| table.cancel(window, cx));
+                    }
+                }),
+            )
             .child(
                 TitleBar::new()
                     .child(
