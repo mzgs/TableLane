@@ -2,7 +2,10 @@ mod settings;
 mod settings_view;
 mod window_state;
 
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::{
+    ActiveTheme, Theme,
+    resizable::{h_resizable, resizable_panel},
+};
 use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
@@ -81,7 +84,29 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(cx.theme().background)
+        h_resizable("workspace")
+            .child(
+                resizable_panel()
+                    .size(px(240.))
+                    .size_range(px(160.)..px(400.))
+                    .flex_none()
+                    .child(
+                        div()
+                            .id("sidebar")
+                            .test_support()
+                            .size_full()
+                            .bg(cx.theme().sidebar),
+                    ),
+            )
+            .child(
+                resizable_panel().child(
+                    div()
+                        .id("content")
+                        .test_support()
+                        .size_full()
+                        .bg(cx.theme().background),
+                ),
+            )
     }
 }
 
@@ -184,4 +209,41 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppView;
+    use gpui_kit::{
+        AppContext, TestAppContext, component::Root, point, px, size, test::TestWindowExt,
+    };
+
+    #[gpui_kit::test]
+    fn sidebar_resizes_by_dragging_its_divider(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(800.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| AppView::new(None, None, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let sidebar = window.find("sidebar").bounds();
+            assert_eq!(sidebar.left(), px(0.));
+            assert!((sidebar.size.width - px(240.)).abs() <= px(1.));
+            let divider = point(sidebar.right(), sidebar.center().y);
+            window.drag(divider, divider + point(px(80.), px(0.)), cx);
+            let resized = window.find("sidebar").bounds();
+            assert!(resized.size.width > sidebar.size.width + px(60.));
+            assert!(window.find("content").bounds().left() >= resized.right());
+            let divider = point(resized.right(), resized.center().y);
+            window.drag(divider, divider + point(px(500.), px(0.)), cx);
+            assert!(window.find("sidebar").bounds().size.width <= px(400.));
+            let sidebar = window.find("sidebar").bounds();
+            let divider = point(sidebar.right(), sidebar.center().y);
+            window.drag(divider, point(px(0.), divider.y), cx);
+            assert!(window.find("sidebar").bounds().size.width >= px(160.));
+        })
+        .unwrap();
+    }
 }
