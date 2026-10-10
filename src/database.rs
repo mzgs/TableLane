@@ -3,6 +3,77 @@ use sqlx::{Connection as _, MySqlConnection, Row};
 use std::collections::BTreeMap;
 
 const CELL_PREVIEW_CHARS: usize = 200;
+pub(crate) const PAGE_SIZE: usize = 1000;
+
+#[derive(Clone, Default)]
+pub(crate) struct TableQuery {
+    pub(crate) page: usize,
+    pub(crate) filters: Vec<(String, String)>,
+    pub(crate) sort: Option<(String, bool)>,
+}
+
+impl TableQuery {
+    fn clauses(&self, schema: &TableSchema) -> Result<(String, Vec<String>, u64), String> {
+        let offset = self
+            .page
+            .checked_mul(PAGE_SIZE)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or("Page is too large.")?;
+        let mut predicates = Vec::new();
+        let mut values = Vec::new();
+        for (name, value) in &self.filters {
+            let ix = schema
+                .columns
+                .iter()
+                .position(|column| column == name)
+                .ok_or("Filter column is unavailable.")?;
+            predicates.push(format!(
+                "{} LIKE ? ESCAPE '='",
+                schema.expression(ix, false)
+            ));
+            values.push(format!(
+                "%{}%",
+                value
+                    .replace('=', "==")
+                    .replace('%', "=%")
+                    .replace('_', "=_")
+            ));
+        }
+        let mut order = Vec::new();
+        if let Some((name, descending)) = &self.sort {
+            if !schema.columns.contains(name) {
+                return Err("Sort column is unavailable.".into());
+            }
+            order.push(format!(
+                "{} {}",
+                quote_identifier(name),
+                if *descending { "DESC" } else { "ASC" }
+            ));
+        }
+        // shortcut: tables without a primary key sort by all columns; use a unique index when supporting expensive large-column tables.
+        let tie_breakers = if schema.primary_key.is_empty() {
+            (0..schema.columns.len()).collect::<Vec<_>>()
+        } else {
+            schema.primary_key.clone()
+        };
+        for ix in tie_breakers {
+            let name = &schema.columns[ix];
+            if self.sort.as_ref().is_none_or(|(sorted, _)| sorted != name) {
+                order.push(format!("{} ASC", quote_identifier(name)));
+            }
+        }
+        let filter = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", predicates.join(" AND "))
+        };
+        Ok((
+            format!("{filter} ORDER BY {} LIMIT ? OFFSET ?", order.join(", ")),
+            values,
+            offset,
+        ))
+    }
+}
 
 pub(crate) struct Session {
     connection: async_std::sync::Mutex<MySqlConnection>,
@@ -23,6 +94,7 @@ pub(crate) struct TableRows {
     pub(crate) schema: TableSchema,
     pub(crate) rows: Vec<Vec<Option<String>>>,
     pub(crate) keys: Vec<Vec<Option<String>>>,
+    pub(crate) has_more: bool,
 }
 
 impl TableSchema {
@@ -139,6 +211,7 @@ impl Session {
         &self,
         database: &str,
         table: &str,
+        options: &TableQuery,
     ) -> Result<TableRows, String> {
         async_std::future::timeout(std::time::Duration::from_secs(15), async {
             let mut connection = self.connection.lock().await;
@@ -158,13 +231,17 @@ impl Session {
             }
             let mut expressions = (0..schema.columns.len()).map(|ix| schema.expression(ix, true)).collect::<Vec<_>>();
             expressions.extend(schema.primary_key.iter().map(|ix| schema.expression(*ix, false)));
-            // shortcut: preview is capped at 1,000 rows, add pagination when browsing beyond the preview is needed.
-            let query = format!("SELECT {} FROM {}.{} LIMIT 1000", expressions.join(", "), quote_identifier(database), quote_identifier(table));
-            let records = sqlx::query(&query).fetch_all(&mut *connection).await?;
+            let (clauses, values, offset) = options.clauses(&schema).map_err(sqlx::Error::Protocol)?;
+            let query = format!("SELECT {} FROM {}.{}{clauses}", expressions.join(", "), quote_identifier(database), quote_identifier(table));
+            let mut statement = sqlx::query(&query);
+            for value in values { statement = statement.bind(value); }
+            let mut records = statement.bind((PAGE_SIZE + 1) as u64).bind(offset).fetch_all(&mut *connection).await?;
+            let has_more = records.len() > PAGE_SIZE;
+            records.truncate(PAGE_SIZE);
             let rows = records.iter().map(|row| (0..schema.columns.len()).map(|ix| row.try_get::<Option<String>, _>(ix).map(|value| value.map(truncate_preview))).collect())
                 .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
             let keys = records.iter().map(|row| (schema.columns.len()..expressions.len()).map(|ix| row.try_get::<Option<String>, _>(ix)).collect()).collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
-            Ok::<_, sqlx::Error>(TableRows { schema, rows, keys })
+            Ok::<_, sqlx::Error>(TableRows { schema, rows, keys, has_more })
         }).await.map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
             .map_err(|error| format!("Couldn’t load table: {error}. Double-click the table to try again."))
     }
@@ -380,6 +457,203 @@ pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_queries_bind_literal_filters_validate_columns_and_order_pages() {
+        use super::{TableQuery, TableSchema};
+        let schema = TableSchema {
+            columns: vec!["id".into(), "text`value".into(), "bytes".into()],
+            column_types: vec!["int".into(), "text".into(), "blob".into()],
+            primary_key: vec![0],
+            ..TableSchema::default()
+        };
+        let query = TableQuery {
+            page: 2,
+            filters: vec![
+                ("text`value".into(), "a%_=' OR 1=1 --".into()),
+                ("bytes".into(), "00FF".into()),
+            ],
+            sort: Some(("text`value".into(), true)),
+        };
+        let (sql, values, offset) = query.clauses(&schema).unwrap();
+        assert_eq!(
+            sql,
+            " WHERE CAST(`text``value` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' AND HEX(`bytes`) LIKE ? ESCAPE '=' ORDER BY `text``value` DESC, `id` ASC LIMIT ? OFFSET ?"
+        );
+        assert_eq!(values, ["%a=%=_==' OR 1==1 --%", "%00FF%"]);
+        assert_eq!(offset, 2000);
+        assert_eq!(
+            TableQuery::default().clauses(&schema).unwrap().0,
+            " ORDER BY `id` ASC LIMIT ? OFFSET ?"
+        );
+        let no_key = TableSchema {
+            primary_key: vec![],
+            ..schema.clone()
+        };
+        assert_eq!(
+            TableQuery::default().clauses(&no_key).unwrap().0,
+            " ORDER BY `id` ASC, `text``value` ASC, `bytes` ASC LIMIT ? OFFSET ?"
+        );
+        assert!(
+            TableQuery {
+                sort: Some(("missing".into(), false)),
+                ..TableQuery::default()
+            }
+            .clauses(&schema)
+            .is_err()
+        );
+        assert!(
+            TableQuery {
+                filters: vec![("missing".into(), "x".into())],
+                ..TableQuery::default()
+            }
+            .clauses(&schema)
+            .is_err()
+        );
+        assert!(
+            TableQuery {
+                page: usize::MAX,
+                ..TableQuery::default()
+            }
+            .clauses(&schema)
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a temporary MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    fn mariadb_filters_sorts_and_pages_full_values_with_row_keys() {
+        use super::TableQuery;
+        let port = std::env::var("TABLELANE_TEST_MARIADB_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        async_std::task::block_on(async {
+            let session = super::connect(&crate::settings::Connection {
+                name: "Test".into(),
+                database_type: crate::settings::DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(port),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            })
+            .await
+            .unwrap();
+            let mut connection = session.connection.lock().await;
+            sqlx::query("CREATE DATABASE browse_test")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE browse_test.widgets (id INT PRIMARY KEY, category INT, body LONGTEXT, bytes BLOB) ENGINE=InnoDB").execute(&mut *connection).await.unwrap();
+            sqlx::query("INSERT INTO browse_test.widgets SELECT seq, seq % 2, CONCAT(REPEAT('x', 250), 'tail', seq), X'00FF' FROM browse_test.seq_1_to_2005").execute(&mut *connection).await.unwrap();
+            sqlx::query("UPDATE browse_test.widgets SET body = ? WHERE id = 2004")
+                .bind("literal%_=' OR 1=1 --")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            drop(connection);
+            let mut query = TableQuery::default();
+            let first = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(first.rows.len(), 1000);
+            assert!(first.has_more);
+            assert_eq!(first.rows[0][0].as_deref(), Some("1"));
+            assert_eq!(first.rows[999][0].as_deref(), Some("1000"));
+            assert_eq!(first.keys[999], [Some("1000".into())]);
+            query.page = 1;
+            let second = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(second.rows[0][0].as_deref(), Some("1001"));
+            assert!(second.has_more);
+            query.page = 2;
+            let last = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(last.rows.len(), 5);
+            assert!(!last.has_more);
+            assert_eq!(last.rows[4][0].as_deref(), Some("2005"));
+            query.page = 0;
+            query.sort = Some(("id".into(), true));
+            let sorted = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(sorted.rows[0][0].as_deref(), Some("2005"));
+            assert_eq!(sorted.rows[999][0].as_deref(), Some("1006"));
+            query.sort = Some(("category".into(), false));
+            let ties = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(ties.rows[0][0].as_deref(), Some("2"));
+            assert_eq!(ties.rows[999][0].as_deref(), Some("2000"));
+            query.page = 1;
+            let ties_next = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(ties_next.rows[0][0].as_deref(), Some("2002"));
+            query.page = 0;
+            query.filters = vec![
+                ("body".into(), "tail2005".into()),
+                ("category".into(), "1".into()),
+            ];
+            let filtered = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(filtered.rows.len(), 1);
+            assert!(!filtered.has_more);
+            assert_eq!(filtered.keys[0], [Some("2005".into())]);
+            assert!(filtered.rows[0][2].as_ref().unwrap().ends_with('…'));
+            assert!(
+                session
+                    .read_row(
+                        "browse_test",
+                        "widgets",
+                        &filtered.schema,
+                        &filtered.keys[0]
+                    )
+                    .await
+                    .unwrap()[2]
+                    .as_ref()
+                    .unwrap()
+                    .ends_with("tail2005")
+            );
+            query.filters = vec![("body".into(), "%_=' OR 1=1 --".into())];
+            let literal = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(literal.rows.len(), 1);
+            assert_eq!(literal.rows[0][0].as_deref(), Some("2004"));
+            query.filters = vec![("bytes".into(), "00FF".into())];
+            assert!(
+                session
+                    .read_table("browse_test", "widgets", &query)
+                    .await
+                    .unwrap()
+                    .has_more
+            );
+            query.filters = vec![("body".into(), "unmatched".into())];
+            let empty = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert!(empty.rows.is_empty());
+            assert!(!empty.has_more);
+            sqlx::query("DROP DATABASE browse_test")
+                .execute(&mut *session.connection.lock().await)
+                .await
+                .unwrap();
+        });
+    }
     use super::connection_url;
     use crate::settings::{Connection, DatabaseKind};
 
@@ -412,7 +686,11 @@ mod tests {
             sqlx::query("INSERT INTO row_editor_test.`edit``rows` (id, token, body, nullable, bytes, short) VALUES (1, ?, ?, NULL, X'00FF', 'old')").bind("ع".repeat(260)).bind("世界".repeat(500)).execute(&mut *connection).await.unwrap();
             drop(connection);
             let data = session
-                .read_table("row_editor_test", "edit`rows")
+                .read_table(
+                    "row_editor_test",
+                    "edit`rows",
+                    &super::TableQuery::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(data.keys[0][1], Some("ع".repeat(260)));
@@ -606,12 +884,20 @@ mod tests {
         let session = async_std::task::block_on(super::connect(&connection)).unwrap();
         assert_eq!(session.databases["tablelane_test"], vec!["widgets"]);
         assert!(session.databases["empty_db"].is_empty());
-        let rows =
-            async_std::task::block_on(session.read_table("tablelane_test", "widgets")).unwrap();
+        let rows = async_std::task::block_on(session.read_table(
+            "tablelane_test",
+            "widgets",
+            &super::TableQuery::default(),
+        ))
+        .unwrap();
         assert!(!rows.schema.columns.is_empty());
         assert!(
-            async_std::task::block_on(session.read_table("tablelane_test", "missing_table"))
-                .is_err()
+            async_std::task::block_on(session.read_table(
+                "tablelane_test",
+                "missing_table",
+                &super::TableQuery::default()
+            ))
+            .is_err()
         );
         async_std::task::block_on(async {
             let mut connection = session.connection.lock().await;
@@ -624,7 +910,11 @@ mod tests {
             }
             drop(connection);
             let rows = session
-                .read_table("preview`test", "types`/table")
+                .read_table(
+                    "preview`test",
+                    "types`/table",
+                    &super::TableQuery::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -661,7 +951,11 @@ mod tests {
                 .execute(&mut *connection).await.unwrap();
             drop(connection);
             let preview = session
-                .read_table("preview`test", "types`/table")
+                .read_table(
+                    "preview`test",
+                    "types`/table",
+                    &super::TableQuery::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(preview.rows[0][3], Some(format!("{}…", "ع".repeat(200))));
@@ -676,7 +970,11 @@ mod tests {
             drop(connection);
             assert_eq!(
                 session
-                    .read_table("preview`test", "types`/table")
+                    .read_table(
+                        "preview`test",
+                        "types`/table",
+                        &super::TableQuery::default()
+                    )
                     .await
                     .unwrap()
                     .rows
@@ -690,7 +988,11 @@ mod tests {
                 .unwrap();
             drop(connection);
             let empty = session
-                .read_table("preview`test", "types`/table")
+                .read_table(
+                    "preview`test",
+                    "types`/table",
+                    &super::TableQuery::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(empty.schema.columns.len(), 6);

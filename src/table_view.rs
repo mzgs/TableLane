@@ -1,13 +1,14 @@
 use crate::{
     connections::OpenTable,
-    database::{TableRows, TableSchema, truncate_preview},
+    database::{PAGE_SIZE, TableQuery, TableRows, TableSchema, truncate_preview},
 };
 use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Sizable,
-        button::Button,
+        button::{Button, ButtonVariants},
         form::{Field, Form},
-        input::{InputEvent, Textarea, TextareaState},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        select::{Select, SelectEvent, SelectState},
         table::{Column, DataTable, TableDelegate, TableEvent, TableState},
         tooltip::Tooltip,
     },
@@ -18,6 +19,7 @@ use gpui_kit::{
 struct Rows {
     columns: Vec<Column>,
     data: TableRows,
+    owner: WeakEntity<TableView>,
 }
 
 impl TableDelegate for Rows {
@@ -40,40 +42,86 @@ impl TableDelegate for Rows {
         let column = &self.columns[col_ix];
         let kind = &self.data.schema.column_types[col_ix];
         let label = format!("{} · {}", column.name, kind);
-        div()
-            .id(SharedString::from(format!("column-title-{}", column.key)))
-            .test_support()
-            .aria_label(label.clone())
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-            .flex()
-            .flex_col()
+        let owner = self.owner.upgrade().expect("table owner exists");
+        let view = owner.read(cx);
+        let sorted = view
+            .query
+            .sort
+            .as_ref()
+            .filter(|(name, _)| name == column.key.as_ref());
+        let name = format!(
+            "{}{}",
+            column.name,
+            sorted.map_or("", |(_, descending)| if *descending {
+                " ↓"
+            } else {
+                " ↑"
+            })
+        );
+        let key = column.key.to_string();
+        Button::new(SharedString::from(format!("sort-column-{key}")))
+            .ghost()
+            .small()
             .size_full()
-            .justify_center()
-            .px_1p5()
-            .gap_0p5()
-            .min_w_0()
-            .overflow_hidden()
+            .p_0()
+            .accessibility_label(format!(
+                "Sort by {}{}",
+                column.name,
+                sorted.map_or("", |(_, descending)| if *descending {
+                    ", descending"
+                } else {
+                    ", ascending"
+                })
+            ))
+            .disabled(view.loading || view.saving || view.is_dirty(cx))
+            .on_click(move |_, window, cx| {
+                owner.update(cx, |view, cx| {
+                    let mut query = view.query.clone();
+                    query.page = 0;
+                    query.sort = match &query.sort {
+                        Some((name, false)) if name == &key => Some((key.clone(), true)),
+                        Some((name, true)) if name == &key => None,
+                        _ => Some((key.clone(), false)),
+                    };
+                    view.load(query, window, cx);
+                });
+            })
             .child(
                 div()
-                    .id(SharedString::from(format!("column-name-{}", column.key)))
+                    .id(SharedString::from(format!("column-title-{}", column.key)))
                     .test_support()
-                    .truncate()
-                    .text_sm()
-                    .line_height(relative(1.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
-                    .child(column.name.clone()),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("column-type-{}", column.key)))
-                    .test_support()
-                    .truncate()
-                    .text_xs()
-                    .line_height(relative(1.))
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(cx.theme().muted_foreground)
-                    .child(kind.clone()),
+                    .aria_label(label.clone())
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .justify_center()
+                    .px_1p5()
+                    .gap_0p5()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("column-name-{}", column.key)))
+                            .test_support()
+                            .truncate()
+                            .text_sm()
+                            .line_height(relative(1.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("column-type-{}", column.key)))
+                            .test_support()
+                            .truncate()
+                            .text_xs()
+                            .line_height(relative(1.))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(kind.clone()),
+                    ),
             )
     }
 
@@ -107,7 +155,7 @@ impl TableDelegate for Rows {
         div()
             .p_4()
             .text_color(cx.theme().muted_foreground)
-            .child("No rows in this table")
+            .child("No matching rows. Clear filters or refresh the table.")
     }
 }
 
@@ -147,6 +195,10 @@ pub(crate) struct TableView {
     saving: bool,
     edit_error: Option<String>,
     error: Option<String>,
+    query: TableQuery,
+    loading: bool,
+    filter_column: Option<Entity<SelectState<Vec<String>>>>,
+    filter_value: Option<Entity<InputState>>,
 }
 
 impl EventEmitter<TableEvent> for TableView {}
@@ -155,25 +207,77 @@ impl TableView {
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title = request.table.clone();
         let location = format!("{} / {}", request.connection_name, request.database);
-        let load_request = request.clone();
-        let task = cx.background_spawn(async move {
-            async_std::task::block_on(
-                load_request
-                    .session
-                    .read_table(&load_request.database, &load_request.table),
-            )
-        });
-        cx.spawn_in(window, async move |view, cx| {
-            let result = task.await;
-            let _ = view.update_in(cx, |view, window, cx| view.finish(result, window, cx));
-        })
-        .detach();
-        Self {
+        let mut view = Self {
             title,
             location,
             request: Some(request),
             ..Self::default()
+        };
+        view.load(TableQuery::default(), window, cx);
+        view
+    }
+
+    fn load(&mut self, query: TableQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading || self.saving || self.is_dirty(cx) {
+            return;
         }
+        let Some(request) = self.request.clone() else {
+            return;
+        };
+        self.loading = true;
+        self.error = None;
+        self.fields.clear();
+        self.selected_row = None;
+        self.loading_row = false;
+        self.load_generation += 1;
+        let generation = self.load_generation;
+        cx.emit(TableEvent::ClearSelection);
+        let load_query = query.clone();
+        let task = cx.background_spawn(async move {
+            async_std::task::block_on(request.session.read_table(
+                &request.database,
+                &request.table,
+                &load_query,
+            ))
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = task.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                if view.load_generation != generation {
+                    return;
+                }
+                view.loading = false;
+                match result {
+                    Ok(data) => {
+                        view.query = query;
+                        view.finish(Ok(data), window, cx);
+                    }
+                    Err(error) => {
+                        view.error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(column), Some(value)) = (&self.filter_column, &self.filter_value) else {
+            return;
+        };
+        let Some(name) = column.read(cx).selected_value().cloned() else {
+            return;
+        };
+        let value = value.read(cx).value().to_string();
+        let mut query = self.query.clone();
+        query.page = 0;
+        query.filters.retain(|(column, _)| column != &name);
+        if !value.is_empty() {
+            query.filters.push((name, value));
+        }
+        self.load(query, window, cx);
     }
 
     fn finish(
@@ -188,6 +292,46 @@ impl TableView {
         self.load_generation += 1;
         match result {
             Ok(data) => {
+                if self.filter_column.is_none() {
+                    let column = cx.new(|cx| {
+                        SelectState::new(
+                            data.schema.columns.clone(),
+                            Some(component::IndexPath::new(0)),
+                            window,
+                            cx,
+                        )
+                    });
+                    cx.subscribe_in(
+                        &column,
+                        window,
+                        |view, _, event: &SelectEvent<Vec<String>>, window, cx| {
+                            let SelectEvent::Confirm(name) = event;
+                            let value = view
+                                .query
+                                .filters
+                                .iter()
+                                .find(|(column, _)| Some(column) == name.as_ref())
+                                .map(|(_, value)| value.clone())
+                                .unwrap_or_default();
+                            if let Some(input) = &view.filter_value {
+                                input.update(cx, |input, cx| input.set_value(value, window, cx));
+                            }
+                        },
+                    )
+                    .detach();
+                    self.filter_column = Some(column);
+                    let input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("Contains text; empty removes filter")
+                    });
+                    cx.subscribe_in(&input, window, |view, _, event: &InputEvent, window, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            view.apply_filter(window, cx);
+                        }
+                    })
+                    .detach();
+                    self.filter_value = Some(input);
+                }
                 let columns = data
                     .schema
                     .columns
@@ -199,13 +343,25 @@ impl TableView {
                             .movable(false)
                     })
                     .collect();
+                let owner = cx.entity().downgrade();
                 let table = cx.new(|cx| {
-                    TableState::new(Rows { columns, data }, window, cx)
-                        .col_movable(false)
-                        .cell_selectable(true)
-                        .row_header(false)
+                    TableState::new(
+                        Rows {
+                            columns,
+                            data,
+                            owner,
+                        },
+                        window,
+                        cx,
+                    )
+                    .col_movable(false)
+                    .cell_selectable(true)
+                    .row_header(false)
                 });
                 cx.subscribe_in(&table, window, |view, table, event, window, cx| {
+                    if view.loading {
+                        return;
+                    }
                     match event {
                         TableEvent::SelectRow(ix) | TableEvent::SelectCell(ix, _) => {
                             if view.selected_row == Some(*ix) {
@@ -559,7 +715,7 @@ impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if let Some(error) = &self.error {
             Some(error.clone())
-        } else if self.table.is_none() {
+        } else if self.loading || self.table.is_none() {
             Some("Loading table…".to_owned())
         } else {
             None
@@ -598,6 +754,105 @@ impl Render for TableView {
                             .child(self.location.clone()),
                     ),
             )
+            .when_some(
+                self.filter_column.as_ref().zip(self.filter_value.as_ref()),
+                |view, (column, value)| {
+                    let busy = self.loading || self.saving || self.is_dirty(cx);
+                    view.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_sm().child("Filter"))
+                                    .child(
+                                        div().w_40().flex_none().child(
+                                            Select::new(column)
+                                                .id("filter-column")
+                                                .accessibility_label("Filter column")
+                                                .small()
+                                                .disabled(busy),
+                                        ),
+                                    )
+                                    .child(
+                                        Input::new(value)
+                                            .id("filter-value")
+                                            .aria_label("Contains text")
+                                            .small()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .disabled(busy),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("apply-filter")
+                                            .small()
+                                            .label("Apply")
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.apply_filter(window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("clear-filters")
+                                            .small()
+                                            .outline()
+                                            .label("Clear filters")
+                                            .disabled(busy || self.query.filters.is_empty())
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                let mut query = view.query.clone();
+                                                query.page = 0;
+                                                query.filters.clear();
+                                                if let Some(input) = &view.filter_value {
+                                                    input.update(cx, |input, cx| {
+                                                        input.set_value("", window, cx)
+                                                    });
+                                                }
+                                                view.load(query, window, cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .when(!self.query.filters.is_empty(), |view| {
+                        let summary = self
+                            .query
+                            .filters
+                            .iter()
+                            .map(|(column, value)| format!("{column} contains {value:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        let tooltip_summary = summary.clone();
+                        view.child(
+                            div()
+                                .id("active-filters")
+                                .test_support()
+                                .aria_label(summary.clone())
+                                .truncate()
+                                .flex_shrink_0()
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tooltip_summary.clone()).build(window, cx)
+                                })
+                                .px_3()
+                                .pb_2()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(summary),
+                        )
+                    })
+                },
+            )
             .when_some(status, |view, status| {
                 view.child(
                     div()
@@ -608,6 +863,7 @@ impl Render for TableView {
                         .px_3()
                         .py_2()
                         .flex_shrink_0()
+                        .when(self.loading, |status| status.flex_1())
                         .text_sm()
                         .text_color(if self.error.is_some() {
                             cx.theme().danger
@@ -618,14 +874,83 @@ impl Render for TableView {
                 )
             })
             .when_some(self.table.as_ref(), |view, table| {
-                view.child(
+                view.when(!self.loading, |view| {
+                    view.child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .pl_3()
+                            .child(DataTable::new(table).small().bordered(false).stripe(true)),
+                    )
+                })
+                .child({
+                    let data = &table.read(cx).delegate().data;
+                    let busy = self.loading || self.saving || self.is_dirty(cx);
+                    let start = self.query.page * PAGE_SIZE;
+                    let range = if data.rows.is_empty() {
+                        "No rows".to_owned()
+                    } else {
+                        format!("Rows {}–{}", start + 1, start + data.rows.len())
+                    };
+                    let label = format!("Page {} · {range}", self.query.page + 1);
                     div()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .pl_3()
-                        .child(DataTable::new(table).small().bordered(false).stripe(true)),
-                )
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            Button::new("previous-page")
+                                .small()
+                                .outline()
+                                .label("Previous")
+                                .disabled(busy || self.query.page == 0)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if view.query.page == 0 {
+                                        return;
+                                    }
+                                    let mut query = view.query.clone();
+                                    query.page -= 1;
+                                    view.load(query, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("page-status")
+                                .test_support()
+                                .role(Role::Status)
+                                .aria_label(label.clone())
+                                .text_xs()
+                                .child(label),
+                        )
+                        .child(
+                            Button::new("next-page")
+                                .small()
+                                .outline()
+                                .label("Next")
+                                .disabled(busy || !data.has_more)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    let mut query = view.query.clone();
+                                    query.page += 1;
+                                    view.load(query, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("refresh-table")
+                                .small()
+                                .ghost()
+                                .label("Refresh")
+                                .disabled(busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.load(view.query.clone(), window, cx)
+                                })),
+                        )
+                })
             })
     }
 }
@@ -675,6 +1000,7 @@ mod tests {
                 .unwrap();
             sqlx::query("CREATE TABLE sidebar_edit_test.widgets (id INT PRIMARY KEY, name VARCHAR(20), notes LONGTEXT, nullable TEXT) ENGINE=InnoDB").execute(&mut database).await.unwrap();
             sqlx::query("INSERT INTO sidebar_edit_test.widgets VALUES (1, 'Original', ?, NULL), (2, 'Other', '', NULL)").bind(&initial_notes).execute(&mut database).await.unwrap();
+            sqlx::query("INSERT INTO sidebar_edit_test.widgets SELECT seq, 'Other', '', NULL FROM sidebar_edit_test.seq_3_to_1002").execute(&mut database).await.unwrap();
             let session = crate::database::connect(&Connection {
                 name: "Test".into(),
                 database_type: DatabaseKind::MariaDB,
@@ -741,7 +1067,13 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            window.render_frame(cx);
             assert_eq!(window.find("row-edit-status").label(), Some("Edited"));
+            window.click("next-page", cx);
+            window.click("sort-column-id", cx);
+            assert_eq!(view.read(cx).query.page, 0);
+            assert!(view.read(cx).query.sort.is_none());
+            assert!(view.read(cx).is_dirty(cx));
             assert_eq!(
                 view.read(cx)
                     .table
@@ -762,6 +1094,7 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
             window.render_frame(cx);
             assert_eq!(
                 window.find(field_id(&view, "name", cx)).value(),
@@ -815,6 +1148,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            window.render_frame(cx);
             assert_eq!(
                 window.find(field_id(&view, "nullable", cx)).value(),
                 Some("")
@@ -845,10 +1179,209 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            window.render_frame(cx);
             assert_eq!(window.find(field_id(&view, "id", cx)).value(), Some("1"));
             assert!(window.try_find("row-edit-error").is_none());
+            window.click("next-page", cx);
         })
         .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.page == 1
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("page-status").label(),
+                Some("Page 2 · Rows 1001–1002")
+            );
+            assert!(
+                window.find("filter-value").bounds().bottom()
+                    <= window.find("table").bounds().top()
+            );
+            assert!(
+                window.find("apply-filter").bounds().bottom()
+                    <= window.find("table").bounds().top()
+            );
+            assert!(window.find("filter-value").bounds().size.width >= window.rem_size() * 4.);
+            assert_eq!(
+                view.read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("1001")
+            );
+            window.click("filter-value", cx);
+            window.input("1002", cx);
+            assert_eq!(window.find("filter-value").value(), Some("1002"));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && !view.read(cx).query.filters.is_empty()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("page-status").label(),
+                Some("Page 1 · Rows 1–1")
+            );
+            assert_eq!(
+                view.read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("1002")
+            );
+            window.click("clear-filters", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.filters.is_empty()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("sort-column-id", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.sort == Some(("id".into(), false))
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.click("sort-column-id", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.sort == Some(("id".into(), true))
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("1002")
+            );
+            window.click("next-page", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.page == 1
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("2")
+            );
+            window.click("previous-page", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.page == 0
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("sort-column-id", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).query.sort.is_none()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("filter-value", cx);
+            window.press("secondary-a", cx);
+            window.input("unmatched", cx);
+            window.click("apply-filter", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && !view.read(cx).query.filters.is_empty()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("page-status").label(), Some("Page 1 · No rows"));
+        })
+        .unwrap();
+        async_std::task::block_on(
+            sqlx::query("RENAME TABLE sidebar_edit_test.widgets TO sidebar_edit_test.unavailable")
+                .execute(&mut database),
+        )
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("refresh-table", cx)
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).error.is_some()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("table-status")
+                    .label()
+                    .unwrap()
+                    .contains("Couldn’t load table")
+            );
+            assert!(view.read(cx).table.is_some());
+            assert_eq!(
+                view.read(cx).query.filters,
+                [("id".into(), "unmatched".into())]
+            );
+        })
+        .unwrap();
+        async_std::task::block_on(
+            sqlx::query("RENAME TABLE sidebar_edit_test.unavailable TO sidebar_edit_test.widgets")
+                .execute(&mut database),
+        )
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("refresh-table", cx)
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !view.read(cx).loading && view.read(cx).error.is_none()
+        })
+        .await;
         async_std::task::block_on(
             sqlx::query("DROP DATABASE sidebar_edit_test").execute(&mut database),
         )
@@ -874,6 +1407,7 @@ mod tests {
             table.update(cx, |view, cx| {
                 view.finish(
                     Ok(TableRows {
+                        has_more: false,
                         schema: TableSchema {
                             columns: vec!["id".into(), "name".into()],
                             column_types: vec!["int".into(), "text".into()],
@@ -1023,6 +1557,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.finish(
                     Ok(TableRows {
+                        has_more: false,
                         schema: TableSchema {
                             columns: vec!["id".into(), "name".into()],
                             column_types: vec!["bigint unsigned".into(), "varchar(255)".into()],
@@ -1086,6 +1621,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.finish(
                     Ok(TableRows {
+                        has_more: false,
                         schema: TableSchema {
                             columns: vec!["id".into()],
                             column_types: vec!["bigint unsigned".into()],
