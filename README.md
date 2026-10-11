@@ -19,6 +19,8 @@ Cell previews fetch at most 200 text characters or 100 binary bytes, plus a smal
 
 Saving requires an InnoDB table with a primary key. Saves check the original row for concurrent changes and roll back failed or lossy conversions. Generated, spatial, and bit columns cannot be edited; binary fields use hexadecimal text. Untouched NULL values are preserved, while typing into a NULL field makes it a text value.
 
+Click History… beside Run to see completed SQL commands for the current connection name and database, newest first, including failures and execution status. Click a history row to load its SQL, or use the arrow keys and Enter. Loading replaces the editor text without executing it; Cmd+Z restores the previous draft. History keeps the latest 100 commands across all connections and survives app restarts in `sql-history.json` beside the settings file. SQL text and database errors are stored locally as plain text; history is separate from settings exports. History load or save errors appear in the history dialog.
+
 Live MariaDB tests require an isolated server containing `tablelane_test.widgets` and an empty `empty_db` database, with a passwordless `root` account. Run them with `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked mariadb_ -- --ignored`.
 
 Connection passwords are encrypted with AES-256-GCM in settings JSON and settings exports, using a fresh random nonce for each save. Older plaintext passwords still load and are encrypted on the next save.

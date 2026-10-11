@@ -1,16 +1,19 @@
 use crate::{connections::OpenTable, database::TableRows};
+mod history;
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Icon, Sizable,
-        button::Button,
+        ActiveTheme, Disableable, Icon, IndexPath, Sizable, WindowExt,
+        button::{Button, ButtonVariants},
         clipboard::Clipboard,
         input::{CompletionProvider, Editor, EditorState, InputEvent, Rope, RopeExt},
+        list::{List, ListDelegate, ListEvent, ListItem, ListState},
         table::{Column, DataTable, TableDelegate, TableState},
         text::{SelectionFormat, TextView},
     },
     prelude::FluentBuilder,
     *,
 };
+use history::History;
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
     TextEdit,
@@ -195,6 +198,9 @@ pub(crate) struct SqlEditor {
 
 impl SqlEditor {
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        if cx.try_global::<History>().is_none() {
+            cx.set_global(History::load());
+        }
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunSql, Some("SqlEditor")),
             KeyBinding::new("ctrl-enter", RunSql, Some("SqlEditor")),
@@ -265,6 +271,7 @@ impl SqlEditor {
         self.status = "Running SQL…".into();
         self.results = None;
         let request = self.request.clone();
+        let history_sql = sql.clone();
         let task = cx.background_spawn(async move {
             let start = std::time::Instant::now();
             let result =
@@ -312,11 +319,151 @@ impl SqlEditor {
                         editor.failed = true;
                     }
                 }
+                cx.global_mut::<History>().record(
+                    editor.request.connection_name.clone(),
+                    editor.request.database.clone(),
+                    history_sql,
+                    editor.status.clone(),
+                    editor.failed,
+                );
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running || window.has_active_dialog(cx) {
+            return;
+        }
+        let history = cx.global::<History>();
+        let entries: Vec<_> = history
+            .entries(&self.request.connection_name, &self.request.database)
+            .cloned()
+            .collect();
+        let error = history.error.clone();
+        let list = cx.new(|cx| ListState::new(HistoryList { entries }, window, cx));
+        list.update(cx, |list, cx| {
+            if !list.delegate().entries.is_empty() {
+                list.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            }
+        });
+        cx.subscribe_in(&list, window, |editor, list, event, window, cx| {
+            let ListEvent::Confirm(ix) = event else {
+                return;
+            };
+            if editor.running {
+                return;
+            }
+            let sql = list.read(cx).delegate().entries[ix.row].sql.clone();
+            window.close_dialog(cx);
+            editor
+                .input
+                .update(cx, |input, cx| input.replace_all(sql, window, cx));
+            editor.focus(window, cx);
+            cx.notify();
+        })
+        .detach();
+        let title = format!(
+            "SQL history · {} / {}",
+            self.request.connection_name, self.request.database
+        );
+        let history_list = list.clone();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            dialog
+                .title(title.clone())
+                .width(window.rem_size() * 36.)
+                .when_some(error.as_ref(), |dialog, error| {
+                    dialog.child(div().text_color(cx.theme().danger).child(error.clone()))
+                })
+                .child(
+                    div()
+                        .id("sql-history-list")
+                        .h(rems(22.))
+                        .child(List::new(&history_list)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Click a command to load it · ↑/↓ to browse · Enter to load"),
+                )
+        });
+        list.update(cx, |list, cx| list.focus(window, cx));
+    }
+}
+
+struct HistoryList {
+    entries: Vec<history::Entry>,
+}
+
+impl ListDelegate for HistoryList {
+    type Item = ListItem;
+
+    fn items_count(&self, _: usize, _: &App) -> usize {
+        self.entries.len()
+    }
+
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<ListItem> {
+        let entry = self.entries.get(ix.row)?;
+        Some(
+            ListItem::new(("sql-history-entry", entry.id))
+                .accessibility_label(entry.sql.clone())
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .min_w_0()
+                        .w_full()
+                        .child(
+                            div()
+                                .text_sm()
+                                .truncate()
+                                .child(entry.sql.split_whitespace().collect::<Vec<_>>().join(" ")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .truncate()
+                                .text_color(if entry.failed {
+                                    cx.theme().danger
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(format!(
+                                    "{} · {}",
+                                    if entry.failed { "Failed" } else { "Succeeded" },
+                                    entry.status
+                                )),
+                        ),
+                ),
+        )
+    }
+
+    fn set_selected_index(
+        &mut self,
+        _: Option<IndexPath>,
+        _: &mut Window,
+        _: &mut Context<ListState<Self>>,
+    ) {
+    }
+
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .p_3()
+            .text_color(cx.theme().muted_foreground)
+            .child("No commands yet. Run a statement to add it to history.")
     }
 }
 
@@ -385,6 +532,18 @@ impl Render for SqlEditor {
                             .loading(self.running)
                             .disabled(self.running || self.input.read(cx).value().trim().is_empty())
                             .on_click(cx.listener(|editor, _, window, cx| editor.run(window, cx))),
+                    )
+                    .child(
+                        Button::new("sql-history")
+                            .small()
+                            .ghost()
+                            .label("History…")
+                            .disabled(self.running)
+                            .on_click(
+                                cx.listener(|editor, _, window, cx| {
+                                    editor.open_history(window, cx)
+                                }),
+                            ),
                     )
                     .child(
                         div()
@@ -461,7 +620,7 @@ mod tests {
         settings::{Connection, DatabaseKind},
     };
     use gpui_kit::{
-        AppContext, TestAppContext,
+        AppContext, Focusable, TestAppContext,
         component::{Root, WindowExt},
         px, size,
         test::{TestAppContextExt, TestWindowExt},
@@ -560,6 +719,7 @@ mod tests {
             table: "widgets".into(),
         };
         cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_global(super::History::for_test()));
         let mut app = None;
         let handle = cx.open_window(size(px(1300.), px(700.)), |window, cx| {
             let view = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
@@ -769,6 +929,7 @@ mod tests {
             assert_eq!(rows.rows[0][0].as_deref(), Some("original"));
         });
         cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_global(super::History::for_test()));
         let mut editor = None;
         let handle = cx.open_window(size(px(1000.), px(650.)), |window, cx| {
             let view = cx.new(|cx| {
@@ -876,6 +1037,93 @@ mod tests {
                 cx.read_from_clipboard().unwrap().text().as_deref(),
                 Some(error.as_str())
             );
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let history = cx.global::<super::History>();
+            let entries: Vec<_> = history.entries("Test", "sql`test").collect();
+            assert_eq!(entries.len(), 3);
+            assert!(entries[0].failed);
+            assert_eq!(entries[0].sql, "SELECT * FROM missing_table");
+            assert!(!entries[1].failed);
+            window.click("sql-history", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+            window.click("sql-history", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let id = cx
+                .global::<super::History>()
+                .entries("Test", "sql`test")
+                .nth(1)
+                .unwrap()
+                .id;
+            window.click(("sql-history-entry", id), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert_eq!(
+                editor.read(cx).input.read(cx).value().as_ref(),
+                "UPDATE widgets SET name = 'updated' WHERE id = 1"
+            );
+            assert!(!editor.read(cx).running);
+            assert_eq!(
+                cx.global::<super::History>()
+                    .entries("Test", "sql`test")
+                    .count(),
+                3
+            );
+            assert!(
+                editor
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            window.press("cmd-z", cx);
+            assert_eq!(
+                editor.read(cx).input.read(cx).value().as_ref(),
+                "SELECT * FROM missing_table"
+            );
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sql-history", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert_eq!(
+                editor.read(cx).input.read(cx).value().as_ref(),
+                "UPDATE widgets SET name = 'updated' WHERE id = 1"
+            );
+            assert!(!editor.read(cx).running);
         })
         .unwrap();
         async_std::task::block_on(async {
