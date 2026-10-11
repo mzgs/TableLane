@@ -8,11 +8,12 @@ mod table_view;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, TitleBar,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, TitleBar, WindowExt,
     button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
     scroll::ScrollableElement,
     status_bar::StatusBar,
+    tab::{Tab, TabBar},
     table::TableEvent,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -46,11 +47,69 @@ impl AssetSource for Assets {
 
 impl Global for Settings {}
 
-actions!(base_app, [Quit, OpenSettings]);
+actions!(
+    base_app,
+    [Quit, OpenSettings, CloseTab, NextTab, PreviousTab]
+);
+
+enum WorkspaceTab {
+    Table(Entity<table_view::TableView>),
+    Sql(Entity<sql_editor::SqlEditor>, usize),
+}
+
+impl WorkspaceTab {
+    fn id(&self) -> EntityId {
+        match self {
+            Self::Table(table) => table.entity_id(),
+            Self::Sql(editor, _) => editor.entity_id(),
+        }
+    }
+
+    fn request<'a>(&'a self, cx: &'a App) -> Option<&'a connections::OpenTable> {
+        match self {
+            Self::Table(table) => table.read(cx).request(),
+            Self::Sql(editor, _) => Some(editor.read(cx).request()),
+        }
+    }
+
+    fn label(&self, cx: &App) -> String {
+        match self {
+            Self::Table(table) => format!(
+                "{}{}",
+                table.read(cx).title(),
+                if table.read(cx).is_dirty(cx) {
+                    " · Edited"
+                } else {
+                    ""
+                }
+            ),
+            Self::Sql(editor, number) => {
+                let view = editor.read(cx);
+                let request = view.request();
+                format!(
+                    "{} / {} / SQL {number}{}",
+                    request.connection_name,
+                    request.database,
+                    if view.is_running() {
+                        " · Running"
+                    } else if view.has_draft(cx) {
+                        " · Draft"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        }
+    }
+}
 
 struct AppView {
     connections: Entity<connections::Connections>,
-    table: Option<Entity<table_view::TableView>>,
+    tabs: Vec<WorkspaceTab>,
+    active_tab: usize,
+    next_sql_number: usize,
+    tab_scroll: ScrollHandle,
+    focus: FocusHandle,
     sidebar_visible: bool,
     right_sidebar_visible: bool,
     bottom_bar_visible: bool,
@@ -70,6 +129,10 @@ impl AppView {
         cx.bind_keys([
             KeyBinding::new("cmd-s", table_view::SaveRow, Some("TableWorkspace")),
             KeyBinding::new("escape", table_view::CancelRow, Some("RowEditor")),
+            KeyBinding::new("cmd-w", CloseTab, Some("TableWorkspace")),
+            KeyBinding::new("ctrl-w", CloseTab, Some("TableWorkspace")),
+            KeyBinding::new("ctrl-tab", NextTab, Some("TableWorkspace")),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("TableWorkspace")),
         ]);
         let mut window_state = restored.unwrap_or_else(|| WindowState::capture(window));
         window_state.update(window);
@@ -93,21 +156,17 @@ impl AppView {
             &connections,
             window,
             |view, _, event: &connections::OpenTable, window, cx| {
-                if let Some(table) = &view.table
-                    && !table.update(cx, |table, cx| table.prepare_to_close(cx))
-                {
-                    view.right_sidebar_visible = true;
-                    cx.notify();
-                    return;
-                }
-                let table = cx.new(|cx| table_view::TableView::new(event.clone(), window, cx));
-                view.set_table(table, cx);
+                view.open_table(event, window, cx);
             },
         )
         .detach();
         Self {
             connections,
-            table: None,
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_sql_number: 1,
+            tab_scroll: ScrollHandle::new(),
+            focus: cx.focus_handle(),
             sidebar_visible: true,
             right_sidebar_visible: false,
             bottom_bar_visible: true,
@@ -128,25 +187,156 @@ impl AppView {
         }
     }
 
-    fn set_table(&mut self, table: Entity<table_view::TableView>, cx: &mut Context<Self>) {
+    fn set_table(
+        &mut self,
+        table: Entity<table_view::TableView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.observe(&table, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&table, |view, _, event: &TableEvent, cx| {
+        cx.subscribe(&table, |view, table, event: &TableEvent, cx| {
             if matches!(
                 event,
                 TableEvent::SelectRow(_) | TableEvent::SelectCell(_, _)
-            ) {
+            ) && view.table().is_some_and(|active| active == &table)
+            {
                 view.right_sidebar_visible = true;
             }
             cx.notify();
         })
         .detach();
-        self.table = Some(table);
+        self.tabs.push(WorkspaceTab::Table(table));
+        self.select_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    fn table(&self) -> Option<&Entity<table_view::TableView>> {
+        match self.tabs.get(self.active_tab) {
+            Some(WorkspaceTab::Table(table)) => Some(table),
+            _ => None,
+        }
+    }
+
+    fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = ix;
+        self.tab_scroll.scroll_to_item(ix);
+        self.focus.focus(window, cx);
+        match &self.tabs[ix] {
+            WorkspaceTab::Table(table) => table.update(cx, |table, cx| table.focus(window, cx)),
+            WorkspaceTab::Sql(editor, _) => {
+                editor.update(cx, |editor, cx| editor.focus(window, cx))
+            }
+        }
+        cx.notify();
+    }
+
+    fn cycle_tab(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
+            let step = if backwards { self.tabs.len() - 1 } else { 1 };
+            self.select_tab((self.active_tab + step) % self.tabs.len(), window, cx);
+        }
+    }
+
+    fn open_table(
+        &mut self,
+        request: &connections::OpenTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.tabs.iter().position(|tab| {
+            matches!(tab, WorkspaceTab::Table(_))
+                && tab.request(cx).is_some_and(|open| {
+                    std::sync::Arc::ptr_eq(&open.session, &request.session)
+                        && open.database == request.database
+                        && open.table == request.table
+                })
+        });
+        if let Some(ix) = existing {
+            self.select_tab(ix, window, cx);
+        } else {
+            let table = cx.new(|cx| table_view::TableView::new(request.clone(), window, cx));
+            self.set_table(table, window, cx);
+        }
+    }
+
+    fn open_sql_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(request) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.request(cx))
+            .cloned()
+        else {
+            return;
+        };
+        let editor = cx.new(|cx| sql_editor::SqlEditor::new(request, window, cx));
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        self.tabs
+            .push(WorkspaceTab::Sql(editor, self.next_sql_number));
+        self.next_sql_number += 1;
+        self.select_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    fn close_tab(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id() == id) else {
+            return;
+        };
+        match &self.tabs[ix] {
+            WorkspaceTab::Table(table) => {
+                if !table.update(cx, |table, cx| table.prepare_to_close(cx)) {
+                    self.select_tab(ix, window, cx);
+                    self.right_sidebar_visible = true;
+                    return;
+                }
+            }
+            WorkspaceTab::Sql(editor, _) => {
+                if editor.read(cx).is_running() {
+                    return;
+                }
+                if editor.read(cx).has_draft(cx) {
+                    let view = cx.entity().downgrade();
+                    let label = self.tabs[ix].label(cx);
+                    window.open_alert_dialog(cx, move |dialog, _, _| {
+                        let view = view.clone();
+                        dialog
+                            .confirm()
+                            .title("Discard SQL draft?")
+                            .description(format!("Close {label} and discard its SQL text?"))
+                            .ok_text("Discard draft")
+                            .on_ok(move |_, window, cx| {
+                                let _ = view.update(cx, |view, cx| view.remove_tab(id, window, cx));
+                                true
+                            })
+                    });
+                    return;
+                }
+            }
+        }
+        self.remove_tab(id, window, cx);
+    }
+
+    fn remove_tab(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id() == id) else {
+            return;
+        };
+        self.tabs.remove(ix);
+        if ix < self.active_tab {
+            self.active_tab -= 1;
+        }
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+        if !self.tabs.is_empty() {
+            self.select_tab(self.active_tab, window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
         cx.notify();
     }
 }
 
 impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sql_active = matches!(self.tabs.get(self.active_tab), Some(WorkspaceTab::Sql(..)));
         let workspace = h_resizable("workspace")
             .child(
                 resizable_panel()
@@ -188,14 +378,49 @@ impl Render for AppView {
                         .min_w_0()
                         .min_h_0()
                         .bg(cx.theme().background)
-                        .when_some(self.table.as_ref(), |content, table| {
-                            content.child(table.clone())
+                        .flex()
+                        .flex_col()
+                        .when(!self.tabs.is_empty(), |content| {
+                            content.child(
+                                TabBar::new("workspace-tabs")
+                                    .small()
+                                    .flex_shrink_0()
+                                    .menu(true)
+                                    .max_width(rems(20.).to_pixels(window.rem_size()))
+                                    .track_scroll(&self.tab_scroll)
+                                    .selected_index(self.active_tab)
+                                    .children(self.tabs.iter().map(|tab| {
+                                        let id = tab.id();
+                                        let label = tab.label(cx);
+                                        let running = matches!(tab, WorkspaceTab::Sql(editor, _) if editor.read(cx).is_running());
+                                        Tab::new().label(label.clone()).suffix(
+                                            Button::new(("close-tab", id))
+                                                .ghost().xsmall().icon(IconName::Close)
+                                                .accessibility_label(format!("Close {label}"))
+                                                .tooltip(if running { "Wait for the query to finish" } else { "Close tab" })
+                                                .disabled(running)
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                .on_click(cx.listener(move |view, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    view.close_tab(id, window, cx);
+                                                })),
+                                        )
+                                    }))
+                                    .on_click(cx.listener(|view, ix, window, cx| view.select_tab(*ix, window, cx))),
+                            )
+                        })
+                        .when_some(self.tabs.get(self.active_tab), |content, tab| {
+                            let child = match tab {
+                                WorkspaceTab::Table(table) => table.clone().into_any_element(),
+                                WorkspaceTab::Sql(editor, _) => editor.clone().into_any_element(),
+                            };
+                            content.child(div().id(("tab-content", tab.id())).flex_1().min_h_0().min_w_0().child(child))
                         }),
                 ),
             );
         let workspace = workspace.child(
             resizable_panel()
-                .visible(self.right_sidebar_visible)
+                .visible(self.right_sidebar_visible && !sql_active)
                 .size(px(240.))
                 .size_range(px(160.)..px(400.))
                 .flex_none()
@@ -209,7 +434,7 @@ impl Render for AppView {
                         .child(
                             div()
                                 .size_full()
-                                .when_some(self.table.as_ref(), |sidebar, table| {
+                                .when_some(self.table(), |sidebar, table| {
                                     sidebar.child(table.read(cx).render_sidebar(cx))
                                 })
                                 .overflow_y_scrollbar(),
@@ -220,20 +445,32 @@ impl Render for AppView {
             .flex()
             .flex_col()
             .size_full()
+            .track_focus(&self.focus)
             .key_context("TableWorkspace")
+            .on_action(cx.listener(|view, _: &CloseTab, window, cx| {
+                if let Some(tab) = view.tabs.get(view.active_tab) {
+                    view.close_tab(tab.id(), window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|view, _: &NextTab, window, cx| view.cycle_tab(false, window, cx)),
+            )
+            .on_action(
+                cx.listener(|view, _: &PreviousTab, window, cx| view.cycle_tab(true, window, cx)),
+            )
             .on_action(cx.listener(|view, _: &table_view::SaveRow, window, cx| {
-                if let Some(table) = &view.table {
+                if let Some(table) = view.table() {
                     table.update(cx, |table, cx| table.save(window, cx));
                 }
             }))
             .on_action(cx.listener(|view, _: &table_view::CancelRow, window, cx| {
-                if let Some(table) = &view.table {
+                if let Some(table) = view.table() {
                     table.update(cx, |table, cx| table.cancel(window, cx));
                 }
             }))
             .on_action(
                 cx.listener(|view, _: &gpui_kit::component::input::Escape, window, cx| {
-                    if let Some(table) = &view.table {
+                    if let Some(table) = view.table() {
                         table.update(cx, |table, cx| table.cancel(window, cx));
                     }
                 }),
@@ -248,16 +485,15 @@ impl Render for AppView {
                             .accessibility_label("Open SQL editor")
                             .tooltip("Open SQL editor")
                             .disabled(
-                                !self.table.as_ref().is_some_and(|table| {
-                                    table.read(cx).is_sql_editor_available(cx)
-                                }),
+                                self.tabs
+                                    .get(self.active_tab)
+                                    .and_then(|tab| tab.request(cx))
+                                    .is_none(),
                             )
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|view, _, window, cx| {
                                 cx.stop_propagation();
-                                if let Some(table) = &view.table {
-                                    table.update(cx, |table, cx| table.open_sql_editor(window, cx));
-                                }
+                                view.open_sql_editor(window, cx);
                             })),
                     )
                     .child(
@@ -311,7 +547,8 @@ impl Render for AppView {
                             .child(
                                 Button::new("toggle-right-sidebar")
                                     .icon(IconName::PanelRight)
-                                    .selected(self.right_sidebar_visible)
+                                    .selected(self.right_sidebar_visible && !sql_active)
+                                    .disabled(sql_active)
                                     .accessibility_label("Toggle right sidebar")
                                     .tooltip("Show or hide right sidebar")
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {

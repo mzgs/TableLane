@@ -188,8 +188,6 @@ impl RowField {
 
 #[derive(Default)]
 pub(crate) struct TableView {
-    sql_editor: Option<Entity<crate::sql_editor::SqlEditor>>,
-    sql_visible: bool,
     title: String,
     location: String,
     request: Option<OpenTable>,
@@ -213,35 +211,18 @@ pub(crate) struct TableView {
 impl EventEmitter<TableEvent> for TableView {}
 
 impl TableView {
-    pub(crate) fn is_sql_editor_available(&self, cx: &App) -> bool {
-        self.request.is_some()
-            && !self.sql_visible
-            && !self.loading
-            && !self.saving
-            && !self.is_dirty(cx)
+    pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if let Some(table) = &self.table {
+            table.focus_handle(cx).focus(window, cx);
+        }
     }
 
-    pub(crate) fn open_sql_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.is_sql_editor_available(cx) {
-            return;
-        }
-        let Some(request) = self.request.clone() else {
-            return;
-        };
-        if self.sql_editor.is_none() {
-            let editor = cx.new(|cx| crate::sql_editor::SqlEditor::new(request, window, cx));
-            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
-            self.sql_editor = Some(editor);
-        }
-        self.filter_task = None;
-        self.filter_pending = false;
-        self.fields.clear();
-        self.selected_row = None;
-        self.loading_row = false;
-        self.load_generation += 1;
-        cx.emit(TableEvent::ClearSelection);
-        self.sql_visible = true;
-        cx.notify();
+    pub(crate) fn request(&self) -> Option<&OpenTable> {
+        self.request.as_ref()
+    }
+
+    pub(crate) fn title(&self) -> String {
+        format!("{} / {}", self.location, self.title)
     }
 
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -657,21 +638,13 @@ impl TableView {
             .collect();
     }
 
-    fn is_dirty(&self, cx: &App) -> bool {
+    pub(crate) fn is_dirty(&self, cx: &App) -> bool {
         self.fields.iter().any(|field| field.is_edited(cx))
     }
 
     pub(crate) fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
-        if self
-            .sql_editor
-            .as_ref()
-            .is_some_and(|editor| editor.read(cx).is_running())
-        {
-            return false;
-        }
         if self.is_dirty(cx) || self.saving {
-            self.edit_error =
-                Some("Save or cancel your edits before opening another table.".into());
+            self.edit_error = Some("Save or cancel your edits before closing this tab.".into());
             cx.notify();
             false
         } else {
@@ -863,9 +836,6 @@ impl TableView {
 
 impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.sql_visible {
-            return self.sql_editor.as_ref().unwrap().clone().into_any_element();
-        }
         let status = if let Some(error) = &self.error {
             Some(error.clone())
         } else if self.table.is_none() {
@@ -1395,7 +1365,7 @@ mod tests {
             });
             table_view = Some(table.clone());
             let app = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
-            app.update(cx, |app, cx| app.set_table(table, cx));
+            app.update(cx, |app, cx| app.set_table(table, window, cx));
             Root::new(app, window, cx)
         });
         let view = table_view.unwrap();
@@ -1762,6 +1732,112 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn tabs_preserve_row_edits_and_protect_dirty_tabs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut app = None;
+        let mut first = None;
+        let mut second = None;
+        let handle = cx.open_window(size(px(1100.), px(650.)), |window, cx| {
+            let view = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
+            for title in ["widgets", "orders"] {
+                let table = cx.new(|_| TableView {
+                    title: title.into(),
+                    location: "Local / test".into(),
+                    ..TableView::default()
+                });
+                table.update(cx, |table, cx| {
+                    table.finish(
+                        Ok(TableRows {
+                            schema: TableSchema {
+                                columns: vec!["name".into()],
+                                column_types: vec!["text".into()],
+                                ..TableSchema::default()
+                            },
+                            rows: vec![vec![Some("Original".into())]],
+                            keys: vec![vec![]],
+                            has_more: false,
+                        }),
+                        window,
+                        cx,
+                    )
+                });
+                view.update(cx, |view, cx| view.set_table(table.clone(), window, cx));
+                if first.is_none() {
+                    first = Some(table);
+                } else {
+                    second = Some(table);
+                }
+            }
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let first = first.unwrap();
+        let second = second.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / test / orders")
+            );
+            window.within("workspace-tabs").click(0_usize, cx);
+            window.click_at(
+                ("row", 0_usize),
+                point(window.rem_size(), Size::Small.table_row_height() / 2.),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(field_id(&first, "name", cx), cx);
+            window.press("secondary-a", cx);
+            window.input("Draft value", cx);
+            assert_eq!(
+                window.within("workspace-tabs").find(0_usize).label(),
+                Some("Local / test / widgets · Edited")
+            );
+            window.press("ctrl-tab", cx);
+            assert_eq!(
+                window.find("table-title").label(),
+                Some("Local / test / orders")
+            );
+            window.press("ctrl-tab", cx);
+            assert_eq!(
+                window.find(field_id(&first, "name", cx)).value(),
+                Some("Draft value")
+            );
+            window.press("ctrl-shift-tab", cx);
+            assert_eq!(app.read(cx).active_tab, 1);
+            window.click(("close-tab", first.entity_id()), cx);
+            assert_eq!(app.read(cx).tabs.len(), 2);
+            assert_eq!(app.read(cx).active_tab, 0);
+            assert!(window.find("row-edit-error").visible());
+            window.click("cancel-row", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!first.read(cx).is_dirty(cx));
+            window.press("cmd-w", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(app.read(cx).tabs.len(), 1);
+            assert_eq!(app.read(cx).table(), Some(&second));
+            window.press("cmd-w", cx);
+            assert!(app.read(cx).tabs.is_empty());
+            assert!(window.try_find("table-title").is_none());
+            window.press("ctrl-tab", cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn selected_row_opens_sidebar_with_vertical_editable_fields(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1803,7 +1879,7 @@ mod tests {
             });
             table_view = Some(table.clone());
             let app = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
-            app.update(cx, |app, cx| app.set_table(table, cx));
+            app.update(cx, |app, cx| app.set_table(table, window, cx));
             Root::new(app, window, cx)
         });
         let view = table_view.unwrap();

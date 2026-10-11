@@ -89,6 +89,18 @@ impl SqlEditor {
         self.running
     }
 
+    pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.input.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    pub(crate) fn request(&self) -> &OpenTable {
+        &self.request
+    }
+
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
+        !self.input.read(cx).value().trim().is_empty()
+    }
+
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sql = self.input.read(cx).value().to_string();
         if self.running || sql.trim().is_empty() {
@@ -263,10 +275,150 @@ mod tests {
     };
     use gpui_kit::{
         AppContext, TestAppContext,
-        component::Root,
+        component::{Root, WindowExt},
         px, size,
         test::{TestAppContextExt, TestWindowExt},
     };
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_tabs_preserve_sql_drafts_results_and_confirm_discard(cx: &mut TestAppContext) {
+        let session = std::sync::Arc::new(
+            async_std::task::block_on(crate::database::connect(&Connection {
+                name: "Test".into(),
+                database_type: DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(
+                    std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                ),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            }))
+            .unwrap(),
+        );
+        let request = OpenTable {
+            session,
+            connection_name: "Test".into(),
+            database: "tablelane_test".into(),
+            table: "widgets".into(),
+        };
+        cx.update(gpui_kit::init);
+        let mut app = None;
+        let handle = cx.open_window(size(px(1300.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
+            view.update(cx, |view, cx| view.open_table(&request, window, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let timeout = std::time::Duration::from_secs(15);
+        cx.wait_for(handle.into(), timeout, |window, _| {
+            window.try_find("table").is_some()
+        })
+        .await;
+        let table = cx.update(|cx| app.read(cx).table().unwrap().clone());
+        let mut first = None;
+        let mut second = None;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("toggle-right-sidebar", cx);
+            window.click("toolbar-sql-editor", cx);
+            assert!(window.try_find("right-sidebar").is_none());
+            let crate::WorkspaceTab::Sql(editor, _) = &app.read(cx).tabs[1] else {
+                panic!("SQL tab missing")
+            };
+            first = Some(editor.clone());
+            window.input("SELECT SLEEP(1), 42 AS answer", cx);
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        let first = first.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let editor = &first;
+            assert!(editor.read(cx).is_running());
+            window.click(("close-tab", editor.entity_id()), cx);
+            assert_eq!(app.read(cx).tabs.len(), 2);
+            window.click("toolbar-sql-editor", cx);
+            let crate::WorkspaceTab::Sql(editor, _) = &app.read(cx).tabs[2] else {
+                panic!("second SQL tab missing")
+            };
+            second = Some(editor.clone());
+            window.input("SELECT 43", cx);
+            app.update(cx, |app, cx| app.open_table(&request, window, cx));
+            assert_eq!(app.read(cx).tabs.len(), 3);
+            assert_eq!(app.read(cx).table(), Some(&table));
+            window.render_frame(cx);
+            assert!(window.find("right-sidebar").visible());
+            window.within("workspace-tabs").click(2_usize, cx);
+            assert_eq!(
+                second
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                "SELECT 43"
+            );
+        })
+        .unwrap();
+        let second = second.unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !first.read(cx).is_running())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.within("workspace-tabs").click(1_usize, cx);
+            assert_eq!(
+                window.within("workspace-tabs").find(1_usize).label(),
+                Some("Test / tablelane_test / SQL 1 · Draft")
+            );
+            assert_eq!(
+                first.read(cx).input.read(cx).value().as_ref(),
+                "SELECT SLEEP(1), 42 AS answer"
+            );
+            let results = first.read(cx).results.as_ref().unwrap().read(cx);
+            assert_eq!(results.delegate().data.rows[0][1].as_deref(), Some("42"));
+            window.click(("close-tab", second.entity_id()), cx);
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+            assert_eq!(app.read(cx).tabs.len(), 3);
+            window.click(("close-tab", second.entity_id()), cx);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(app.read(cx).tabs.len(), 2);
+            assert_eq!(app.read(cx).active_tab, 1);
+            window.press("cmd-w", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(app.read(cx).tabs.len(), 1);
+            assert_eq!(app.read(cx).table(), Some(&table));
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
