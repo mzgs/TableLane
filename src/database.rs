@@ -296,7 +296,7 @@ impl TableSchema {
     }
 }
 
-fn quote_identifier(name: &str) -> String {
+pub(crate) fn quote_identifier(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 

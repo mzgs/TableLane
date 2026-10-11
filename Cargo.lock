@@ -7704,10 +7704,12 @@ dependencies = [
 name = "tablelane"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-std",
  "base64 0.22.1",
  "dirs 6.0.0",
  "gpui-kit",
+ "lsp-types",
  "ring",
  "serde",
  "serde_json",

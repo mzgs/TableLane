@@ -3,12 +3,101 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Icon, Sizable,
         button::Button,
-        input::{Editor, EditorState, InputEvent},
+        clipboard::Clipboard,
+        input::{CompletionProvider, Editor, EditorState, InputEvent, Rope, RopeExt},
         table::{Column, DataTable, TableDelegate, TableState},
+        text::{SelectionFormat, TextView},
     },
     prelude::FluentBuilder,
     *,
 };
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    TextEdit,
+};
+use std::rc::Rc;
+
+struct SqlCompletions {
+    tables: Vec<String>,
+}
+
+impl SqlCompletions {
+    fn items(&self, text: &Rope, offset: usize) -> Vec<CompletionItem> {
+        let sql = text.to_string();
+        let identifier = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '$');
+        let mut start = offset;
+        for (ix, ch) in sql[..offset].char_indices().rev() {
+            if !identifier(ch) {
+                break;
+            }
+            start = ix;
+        }
+        let prefix = sql[start..offset].to_lowercase();
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let quoted = sql[..start].ends_with('`');
+        if quoted {
+            start -= 1;
+        }
+        let mut end = offset;
+        for ch in sql[offset..].chars() {
+            if !identifier(ch) {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        if quoted && sql[end..].starts_with('`') {
+            end += 1;
+        }
+        let range =
+            lsp_types::Range::new(text.offset_to_position(start), text.offset_to_position(end));
+        // shortcut: prefix matching without SQL parsing, add context-aware ranking when columns and aliases are supported.
+        let keywords = "SELECT FROM WHERE INSERT INTO VALUES UPDATE SET DELETE CREATE ALTER DROP TABLE JOIN LEFT RIGHT INNER OUTER ON AS AND OR NOT NULL IS IN LIKE BETWEEN EXISTS DISTINCT ORDER BY GROUP HAVING LIMIT OFFSET UNION ALL ASC DESC COUNT SUM AVG MIN MAX CASE WHEN THEN ELSE END WITH DATABASE SHOW TABLES TRUNCATE BEGIN COMMIT ROLLBACK";
+        keywords
+            .split_whitespace()
+            .filter(|_| !quoted)
+            .map(|name| (name, name.to_string(), CompletionItemKind::KEYWORD))
+            .chain(self.tables.iter().map(|name| {
+                (
+                    name.as_str(),
+                    crate::database::quote_identifier(name),
+                    CompletionItemKind::CLASS,
+                )
+            }))
+            .filter(|(name, _, _)| name.to_lowercase().starts_with(&prefix))
+            .map(|(name, insert, kind)| CompletionItem {
+                label: name.to_string(),
+                kind: Some(kind),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: insert,
+                })),
+                ..Default::default()
+            })
+            .collect()
+    }
+}
+
+impl CompletionProvider for SqlCompletions {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: CompletionContext,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Task<anyhow::Result<CompletionResponse>> {
+        Task::ready(Ok(CompletionResponse::Array(self.items(text, offset))))
+    }
+
+    fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
+        new_text
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+    }
+}
 
 actions!(sql_editor, [RunSql, ToggleSqlComment]);
 
@@ -112,9 +201,18 @@ impl SqlEditor {
             KeyBinding::new("cmd-/", ToggleSqlComment, Some("SqlEditor")),
         ]);
         let input = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut input = EditorState::new(window, cx)
                 .language("sql")
-                .placeholder("Enter one SQL statement")
+                .placeholder("Enter one SQL statement");
+            input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
+                tables: request
+                    .session
+                    .databases
+                    .get(&request.database)
+                    .cloned()
+                    .unwrap_or_default(),
+            }));
+            input
         });
         input.update(cx, |input, cx| input.focus(window, cx));
         cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
@@ -305,12 +403,43 @@ impl Render for SqlEditor {
                     .pb_2()
                     .text_sm()
                     .flex_shrink_0()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .min_w_0()
                     .text_color(if self.failed {
                         cx.theme().danger
                     } else {
                         cx.theme().muted_foreground
                     })
-                    .child(self.status.clone()),
+                    .child(
+                        div()
+                            .id("sql-message")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                TextView::html(
+                                    "sql-message-text",
+                                    self.status
+                                        .replace('&', "&amp;")
+                                        .replace('<', "&lt;")
+                                        .replace('>', "&gt;")
+                                        .replace('\n', "<br>"),
+                                )
+                                .selectable(true)
+                                .scrollable(false)
+                                .selection_format(SelectionFormat::Plain),
+                            ),
+                    )
+                    .when(self.failed, |status| {
+                        status.child(
+                            Clipboard::new("copy-sql-error")
+                                .value(self.status.clone())
+                                .accessibility_label("Copy SQL error")
+                                .tooltip("Copy SQL error"),
+                        )
+                    }),
             )
             .when_some(self.results.as_ref(), |view, results| {
                 view.child(
@@ -326,7 +455,7 @@ impl Render for SqlEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{SqlEditor, sql_comment_edit};
+    use super::{SqlCompletions, SqlEditor, sql_comment_edit};
     use crate::{
         connections::OpenTable,
         settings::{Connection, DatabaseKind},
@@ -337,6 +466,40 @@ mod tests {
         px, size,
         test::{TestAppContextExt, TestWindowExt},
     };
+
+    #[test]
+    fn sql_completions_match_prefixes_and_replace_complete_identifiers() {
+        let provider = SqlCompletions {
+            tables: vec!["widgets".into(), "we`ird table".into()],
+        };
+        for (sql, offset, label, replacement, start, end) in [
+            ("sEl", 3, "SELECT", "SELECT", 0, 3),
+            ("SELECT * FROM WID", 17, "widgets", "`widgets`", 14, 17),
+            ("SELECT * FROM widg", 16, "widgets", "`widgets`", 14, 18),
+            ("SELECT * FROM `wid`", 18, "widgets", "`widgets`", 14, 19),
+            ("we", 2, "we`ird table", "`we``ird table`", 0, 2),
+            ("SELECT '😀'; sel", 18, "SELECT", "SELECT", 12, 15),
+        ] {
+            let items = provider.items(&gpui_kit::component::input::Rope::from(sql), offset);
+            let item = items.iter().find(|item| item.label == label).unwrap();
+            let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+                panic!("completion must replace the typed prefix")
+            };
+            assert_eq!(edit.new_text, replacement);
+            assert_eq!(edit.range.start.character, start);
+            assert_eq!(edit.range.end.character, end);
+        }
+        assert!(
+            provider
+                .items(&gpui_kit::component::input::Rope::from("SELECT "), 7)
+                .is_empty()
+        );
+        assert!(
+            provider
+                .items(&gpui_kit::component::input::Rope::from("zzzz"), 4)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn sql_comments_preserve_selection_indentation_and_unicode() {
@@ -421,11 +584,46 @@ mod tests {
                 panic!("SQL tab missing")
             };
             first = Some(editor.clone());
+            window.input("sel", cx);
+        })
+        .unwrap();
+        let first = first.unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            first.read(cx).input.read(cx).value().as_ref() == "SELECT"
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(first.read(cx).input.read(cx).value().as_ref(), "SELECT");
+            window.press("secondary-a", cx);
+            window.input("SELECT * FROM wid", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            first.read(cx).input.read(cx).value().as_ref() == "SELECT * FROM `widgets`"
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(
+                first.read(cx).input.read(cx).value().as_ref(),
+                "SELECT * FROM `widgets`"
+            );
+            window.press("secondary-a", cx);
             window.input("SELECT SLEEP(1), 42 AS answer", cx);
             window.click("run-sql", cx);
         })
         .unwrap();
-        let first = first.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let editor = &first;
@@ -592,6 +790,7 @@ mod tests {
         let timeout = std::time::Duration::from_secs(15);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            assert!(window.try_find("copy-sql-error").is_none());
             window.click("run-sql", cx);
             assert!(!editor.read(cx).running);
             window.click(("input", editor.read(cx).input.entity_id()), cx);
@@ -659,6 +858,23 @@ mod tests {
                     .label()
                     .unwrap()
                     .contains("missing_table")
+            );
+            let error = editor.read(cx).status.clone();
+            let bounds = window.find("sql-message").bounds();
+            window.drag(
+                gpui_kit::point(bounds.left() + px(1.), bounds.top() + px(8.)),
+                gpui_kit::point(bounds.right() - px(1.), bounds.bottom() - px(1.)),
+                cx,
+            );
+            window.press("secondary-c", cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(error.as_str())
+            );
+            window.click("copy-sql-error", cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(error.as_str())
             );
         })
         .unwrap();
