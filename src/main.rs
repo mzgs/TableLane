@@ -476,91 +476,99 @@ impl Render for AppView {
                 }),
             )
             .child(
-                TitleBar::new()
-                    .child(
-                        Button::new("toolbar-sql-editor")
-                            .ghost()
-                            .small()
-                            .icon(IconName::SquareTerminal)
-                            .accessibility_label("Open SQL editor")
-                            .tooltip("Open SQL editor")
-                            .disabled(
-                                self.tabs
-                                    .get(self.active_tab)
-                                    .and_then(|tab| tab.request(cx))
-                                    .is_none(),
-                            )
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                cx.stop_propagation();
-                                view.open_sql_editor(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("toolbar-settings")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Settings)
-                            .accessibility_label("Settings…")
-                            .tooltip("Settings…")
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(|_, window, cx| {
-                                cx.stop_propagation();
-                                window.dispatch_action(Box::new(OpenSettings), cx);
-                            }),
-                    )
-                    .child(
-                        ButtonGroup::new("layout-controls")
-                            .small()
-                            .outline()
-                            .mr_2()
-                            .child(
-                                Button::new("toggle-sidebar")
-                                    .icon(IconName::PanelLeft)
-                                    .selected(self.sidebar_visible)
-                                    .accessibility_label("Toggle left sidebar")
-                                    .tooltip("Show or hide left sidebar")
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        cx.stop_propagation();
-                                        view.sidebar_visible = !view.sidebar_visible;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-bottom-bar")
-                                    .icon(IconName::PanelBottom)
-                                    .selected(self.bottom_bar_visible)
-                                    .accessibility_label("Toggle bottom bar")
-                                    .tooltip("Show or hide bottom bar")
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        cx.stop_propagation();
-                                        view.bottom_bar_visible = !view.bottom_bar_visible;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-right-sidebar")
-                                    .icon(IconName::PanelRight)
-                                    .selected(self.right_sidebar_visible && !sql_active)
-                                    .disabled(sql_active)
-                                    .accessibility_label("Toggle right sidebar")
-                                    .tooltip("Show or hide right sidebar")
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        cx.stop_propagation();
-                                        view.right_sidebar_visible = !view.right_sidebar_visible;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
+                TitleBar::new().h_12().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("toolbar-sql-editor")
+                                .ghost()
+                                .large()
+                                .icon(IconName::SquareTerminal)
+                                .accessibility_label("Open SQL editor")
+                                .tooltip("Open SQL editor")
+                                .disabled(
+                                    self.tabs
+                                        .get(self.active_tab)
+                                        .and_then(|tab| tab.request(cx))
+                                        .is_none(),
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    cx.stop_propagation();
+                                    view.open_sql_editor(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("toolbar-settings")
+                                .ghost()
+                                .large()
+                                .icon(IconName::Settings)
+                                .accessibility_label("Settings…")
+                                .tooltip("Settings…")
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.dispatch_action(Box::new(OpenSettings), cx);
+                                }),
+                        )
+                        .child(
+                            ButtonGroup::new("layout-controls")
+                                .large()
+                                .outline()
+                                .mr_2()
+                                .child(
+                                    Button::new("toggle-sidebar")
+                                        .icon(IconName::PanelLeft)
+                                        .selected(self.sidebar_visible)
+                                        .accessibility_label("Toggle left sidebar")
+                                        .tooltip("Show or hide left sidebar")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            cx.stop_propagation();
+                                            view.sidebar_visible = !view.sidebar_visible;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("toggle-bottom-bar")
+                                        .icon(IconName::PanelBottom)
+                                        .selected(self.bottom_bar_visible)
+                                        .accessibility_label("Toggle bottom bar")
+                                        .tooltip("Show or hide bottom bar")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            cx.stop_propagation();
+                                            view.bottom_bar_visible = !view.bottom_bar_visible;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("toggle-right-sidebar")
+                                        .icon(IconName::PanelRight)
+                                        .selected(self.right_sidebar_visible && !sql_active)
+                                        .disabled(sql_active)
+                                        .accessibility_label("Toggle right sidebar")
+                                        .tooltip("Show or hide right sidebar")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            cx.stop_propagation();
+                                            view.right_sidebar_visible =
+                                                !view.right_sidebar_visible;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                ),
             )
             .child(div().flex_1().min_h_0().child(workspace))
             .when(self.bottom_bar_visible, |view| {
@@ -631,6 +639,11 @@ fn main() {
 
         let options = WindowOptions {
             window_bounds: Some(WindowState::window_bounds(restored.as_ref(), cx)),
+            titlebar: Some(TitlebarOptions {
+                // Center the native 14 px controls in the 48 px toolbar.
+                traffic_light_position: Some(point(px(9.), px(17.))),
+                ..TitleBar::title_bar_options()
+            }),
             ..TitleBar::window_options()
         };
         let (handle, _view) = gpui_kit::open_window(options, cx, |window, cx| {
