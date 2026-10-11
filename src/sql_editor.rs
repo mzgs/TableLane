@@ -3,14 +3,54 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Icon, Sizable,
         button::Button,
-        input::{InputEvent, Textarea, TextareaState},
+        input::{Editor, EditorState, InputEvent},
         table::{Column, DataTable, TableDelegate, TableState},
     },
     prelude::FluentBuilder,
     *,
 };
 
-actions!(sql_editor, [RunSql]);
+actions!(sql_editor, [RunSql, ToggleSqlComment]);
+
+fn sql_comment_edit(
+    sql: &str,
+    mut selection: std::ops::Range<usize>,
+) -> (std::ops::Range<usize>, String, std::ops::Range<usize>) {
+    let start = sql[..selection.start].rfind('\n').map_or(0, |ix| ix + 1);
+    let last = if selection.end > selection.start && sql[..selection.end].ends_with('\n') {
+        selection.end - 1
+    } else {
+        selection.end
+    };
+    let end = sql[last..].find('\n').map_or(sql.len(), |ix| last + ix);
+    let lines: Vec<_> = sql[start..end].split('\n').collect();
+    let uncomment = lines.iter().all(|line| {
+        line.trim_start_matches([' ', '\t'])
+            .strip_prefix("--")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    });
+    let mut replacement = sql[start..end].to_string();
+    let mut offset = end;
+    for line in lines.into_iter().rev() {
+        offset -= line.len();
+        let content = line.trim_start_matches([' ', '\t']);
+        let at = offset + line.len() - content.len();
+        let removed = if uncomment {
+            if content.starts_with("-- ") { 3 } else { 2 }
+        } else {
+            0
+        };
+        let prefix = if uncomment { "" } else { "-- " };
+        replacement.replace_range(at - start..at - start + removed, prefix);
+        for point in [&mut selection.start, &mut selection.end] {
+            if *point >= at {
+                *point = *point - (*point - at).min(removed) + prefix.len();
+            }
+        }
+        offset = offset.saturating_sub(1);
+    }
+    (start..end, replacement, selection)
+}
 
 struct Results {
     columns: Vec<Column>,
@@ -57,7 +97,7 @@ impl TableDelegate for Results {
 
 pub(crate) struct SqlEditor {
     request: OpenTable,
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
     results: Option<Entity<TableState<Results>>>,
     running: bool,
     status: String,
@@ -69,9 +109,13 @@ impl SqlEditor {
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunSql, Some("SqlEditor")),
             KeyBinding::new("ctrl-enter", RunSql, Some("SqlEditor")),
+            KeyBinding::new("cmd-/", ToggleSqlComment, Some("SqlEditor")),
         ]);
-        let input =
-            cx.new(|cx| TextareaState::new(window, cx).placeholder("Enter one SQL statement"));
+        let input = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("sql")
+                .placeholder("Enter one SQL statement")
+        });
         input.update(cx, |input, cx| input.focus(window, cx));
         cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
             .detach();
@@ -99,6 +143,18 @@ impl SqlEditor {
 
     pub(crate) fn has_draft(&self, cx: &App) -> bool {
         !self.input.read(cx).value().trim().is_empty()
+    }
+
+    fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running || !self.input.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        self.input.update(cx, |input, cx| {
+            let (range, text, selection) = sql_comment_edit(&input.value(), input.selected_range());
+            input.set_selected_range(range, cx);
+            input.replace(text, window, cx);
+            input.set_selected_range(selection, cx);
+        });
     }
 
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -184,6 +240,9 @@ impl Render for SqlEditor {
                 },
             ))
             .on_action(cx.listener(|editor, _: &RunSql, window, cx| editor.run(window, cx)))
+            .on_action(cx.listener(|editor, _: &ToggleSqlComment, window, cx| {
+                editor.toggle_comment(window, cx)
+            }))
             .child(
                 div()
                     .id("sql-database")
@@ -205,9 +264,8 @@ impl Render for SqlEditor {
                     .child(div().truncate().child(self.request.database.clone())),
             )
             .child(
-                div().p_3().flex_shrink_0().child(
-                    Textarea::new(&self.input)
-                        .accessibility_id("sql-input")
+                div().id("sql-input").p_3().flex_shrink_0().child(
+                    Editor::new(&self.input)
                         .aria_label("SQL statement")
                         .h(rems(10.))
                         .disabled(self.running),
@@ -268,7 +326,7 @@ impl Render for SqlEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::SqlEditor;
+    use super::{SqlEditor, sql_comment_edit};
     use crate::{
         connections::OpenTable,
         settings::{Connection, DatabaseKind},
@@ -279,6 +337,37 @@ mod tests {
         px, size,
         test::{TestAppContextExt, TestWindowExt},
     };
+
+    #[test]
+    fn sql_comments_preserve_selection_indentation_and_unicode() {
+        for (sql, selection, expected) in [
+            ("SELECT '世界'", 11..11, "-- SELECT '世界'"),
+            (
+                "  SELECT 1\n\tSELECT 2",
+                0..20,
+                "  -- SELECT 1\n\t-- SELECT 2",
+            ),
+            ("SELECT 1\nSELECT 2", 0..9, "-- SELECT 1\nSELECT 2"),
+            ("SELECT 1\nSELECT 2", 12..12, "SELECT 1\n-- SELECT 2"),
+            ("", 0..0, "-- "),
+            ("--value", 3..3, "-- --value"),
+            ("SELECT 1\r\nSELECT 2", 0..18, "-- SELECT 1\r\n-- SELECT 2"),
+        ] {
+            let (range, replacement, selected) = sql_comment_edit(sql, selection.clone());
+            let mut commented = sql.to_string();
+            commented.replace_range(range, &replacement);
+            assert_eq!(commented, expected);
+            let (range, replacement, restored_selection) = sql_comment_edit(&commented, selected);
+            commented.replace_range(range, &replacement);
+            assert_eq!(commented, sql);
+            assert_eq!(restored_selection, selection);
+        }
+        assert_eq!(
+            sql_comment_edit("-- SELECT 1\nSELECT 2", 0..20).1,
+            "-- -- SELECT 1\n-- SELECT 2"
+        );
+        assert_eq!(sql_comment_edit("--\tSELECT 1", 5..5).1, "\tSELECT 1");
+    }
 
     #[gpui_kit::test]
     #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
@@ -507,6 +596,15 @@ mod tests {
             assert!(!editor.read(cx).running);
             window.click(("input", editor.read(cx).input.entity_id()), cx);
             window.input("SELECT DATABASE(), 42 AS value, 12.3400 AS amount, '世界' AS text, NULL AS missing, X'00FF' AS bytes, CAST('2026-10-11' AS DATE) AS day, 1 AS value", cx);
+            let sql = editor.read(cx).input.read(cx).value();
+            window.press("cmd-/", cx);
+            assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), format!("-- {sql}"));
+            window.press("cmd-z", cx);
+            assert_eq!(editor.read(cx).input.read(cx).value(), sql);
+            window.press("cmd-shift-z", cx);
+            assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), format!("-- {sql}"));
+            window.press("cmd-/", cx);
+            assert_eq!(editor.read(cx).input.read(cx).value(), sql);
             window.render_frame(cx);
             window.click("run-sql", cx);
             assert!(editor.read(cx).running);
