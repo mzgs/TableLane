@@ -3,11 +3,12 @@ mod connections;
 mod database;
 mod settings;
 mod settings_view;
+mod sql_editor;
 mod table_view;
 mod window_state;
 
 use gpui_kit::component::{
-    ActiveTheme, IconName, Selectable, Sizable, Theme, TitleBar,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, TitleBar,
     button::{Button, ButtonGroup, ButtonVariants},
     resizable::{h_resizable, resizable_panel},
     scroll::ScrollableElement,
@@ -239,6 +240,26 @@ impl Render for AppView {
             )
             .child(
                 TitleBar::new()
+                    .child(
+                        Button::new("toolbar-sql-editor")
+                            .ghost()
+                            .small()
+                            .icon(IconName::SquareTerminal)
+                            .accessibility_label("Open SQL editor")
+                            .tooltip("Open SQL editor")
+                            .disabled(
+                                !self.table.as_ref().is_some_and(|table| {
+                                    table.read(cx).is_sql_editor_available(cx)
+                                }),
+                            )
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(table) = &view.table {
+                                    table.update(cx, |table, cx| table.open_sql_editor(window, cx));
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("toolbar-settings")
                             .ghost()
@@ -823,6 +844,7 @@ mod tests {
                 "toggle-bottom-bar",
                 "toggle-right-sidebar",
                 "toolbar-settings",
+                "toolbar-sql-editor",
             ] {
                 window.double_click(id, cx);
                 assert_eq!(double_clicks.get(), 0, "{id} leaked a double click");
@@ -830,7 +852,17 @@ mod tests {
             assert!(window.find("sidebar").visible());
             assert!(window.find("bottom-bar").visible());
             assert!(window.try_find("right-sidebar").is_none());
-            window.click("title-bar", cx);
+            let title_bar = window.find("title-bar").bounds();
+            let sql_button = window.find("toolbar-sql-editor").bounds();
+            let settings_button = window.find("toolbar-settings").bounds();
+            window.click_at(
+                "title-bar",
+                point(
+                    (sql_button.right() + settings_button.left()) / 2. - title_bar.left(),
+                    title_bar.size.height / 2.,
+                ),
+                cx,
+            );
             assert_eq!(double_clicks.get(), 1);
         })
         .unwrap();

@@ -188,6 +188,8 @@ impl RowField {
 
 #[derive(Default)]
 pub(crate) struct TableView {
+    sql_editor: Option<Entity<crate::sql_editor::SqlEditor>>,
+    sql_visible: bool,
     title: String,
     location: String,
     request: Option<OpenTable>,
@@ -211,6 +213,37 @@ pub(crate) struct TableView {
 impl EventEmitter<TableEvent> for TableView {}
 
 impl TableView {
+    pub(crate) fn is_sql_editor_available(&self, cx: &App) -> bool {
+        self.request.is_some()
+            && !self.sql_visible
+            && !self.loading
+            && !self.saving
+            && !self.is_dirty(cx)
+    }
+
+    pub(crate) fn open_sql_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_sql_editor_available(cx) {
+            return;
+        }
+        let Some(request) = self.request.clone() else {
+            return;
+        };
+        if self.sql_editor.is_none() {
+            let editor = cx.new(|cx| crate::sql_editor::SqlEditor::new(request, window, cx));
+            cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+            self.sql_editor = Some(editor);
+        }
+        self.filter_task = None;
+        self.filter_pending = false;
+        self.fields.clear();
+        self.selected_row = None;
+        self.loading_row = false;
+        self.load_generation += 1;
+        cx.emit(TableEvent::ClearSelection);
+        self.sql_visible = true;
+        cx.notify();
+    }
+
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title = request.table.clone();
         let location = format!("{} / {}", request.connection_name, request.database);
@@ -629,6 +662,13 @@ impl TableView {
     }
 
     pub(crate) fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .sql_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).is_running())
+        {
+            return false;
+        }
         if self.is_dirty(cx) || self.saving {
             self.edit_error =
                 Some("Save or cancel your edits before opening another table.".into());
@@ -823,6 +863,9 @@ impl TableView {
 
 impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sql_visible {
+            return self.sql_editor.as_ref().unwrap().clone().into_any_element();
+        }
         let status = if let Some(error) = &self.error {
             Some(error.clone())
         } else if self.table.is_none() {
@@ -1079,6 +1122,7 @@ impl Render for TableView {
                         )
                 })
             })
+            .into_any_element()
     }
 }
 

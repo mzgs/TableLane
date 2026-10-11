@@ -1,5 +1,5 @@
 use crate::settings::{Connection, DatabaseKind};
-use sqlx::{Connection as _, MySqlConnection, Row};
+use sqlx::{Column as _, Connection as _, Executor as _, MySqlConnection, Row, TypeInfo as _};
 use std::collections::BTreeMap;
 
 const CELL_PREVIEW_CHARS: usize = 200;
@@ -309,6 +309,105 @@ pub(crate) fn truncate_preview(mut value: String) -> String {
 }
 
 impl Session {
+    pub(crate) async fn run_sql(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<(TableRows, u64), String> {
+        use async_std::stream::StreamExt;
+        if sql.trim().is_empty() {
+            return Err("Enter a SQL statement to run.".into());
+        }
+        let result = async {
+            let mut connection = self.connection.lock().await;
+            sqlx::query(&format!("USE {}", quote_identifier(database)))
+                .execute(&mut *connection)
+                .await?;
+            // Preparing validates a single statement without executing it.
+            let description = connection.describe(sql).await?;
+            let schema = TableSchema {
+                columns: description
+                    .columns()
+                    .iter()
+                    .map(|column| column.name().to_owned())
+                    .collect(),
+                column_types: description
+                    .columns()
+                    .iter()
+                    .map(|column| column.type_info().name().to_owned())
+                    .collect(),
+                ..TableSchema::default()
+            };
+            let mut data = TableRows {
+                schema,
+                rows: Vec::new(),
+                keys: Vec::new(),
+                has_more: false,
+            };
+            let mut affected = 0;
+            // shortcut: only the first result set is displayed; add a result selector when needed for stored procedures.
+            let mut first_result = true;
+            let mut stream = sqlx::raw_sql(sql).fetch_many(&mut *connection);
+            while let Some(item) = stream.next().await {
+                match item? {
+                    sqlx::Either::Left(result) => {
+                        affected += result.rows_affected();
+                        first_result = false;
+                    }
+                    sqlx::Either::Right(row) if first_result => {
+                        if data.rows.is_empty() {
+                            data.schema.columns = row
+                                .columns()
+                                .iter()
+                                .map(|column| column.name().to_owned())
+                                .collect();
+                            data.schema.column_types = row
+                                .columns()
+                                .iter()
+                                .map(|column| column.type_info().name().to_owned())
+                                .collect();
+                        }
+                        if data.rows.len() == PAGE_SIZE {
+                            data.has_more = true;
+                            continue;
+                        }
+                        let values = (0..row.len())
+                            .map(|ix| {
+                                let bytes = row.try_get_unchecked::<Option<&[u8]>, _>(ix)?;
+                                Ok(bytes.map(|bytes| {
+                                    let kind = row.columns()[ix].type_info().name();
+                                    if kind.contains("BLOB")
+                                        || kind.contains("BINARY")
+                                        || matches!(kind, "BIT" | "GEOMETRY")
+                                    {
+                                        let mut value = bytes
+                                            .iter()
+                                            .take(100)
+                                            .map(|byte| format!("{byte:02X}"))
+                                            .collect::<String>();
+                                        if bytes.len() > 100 {
+                                            value.push('…');
+                                        }
+                                        value
+                                    } else {
+                                        truncate_preview(
+                                            String::from_utf8_lossy(bytes).into_owned(),
+                                        )
+                                    }
+                                }))
+                            })
+                            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+                        data.rows.push(values);
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<_, sqlx::Error>((data, affected))
+        }
+        .await;
+        result.map_err(|error| format!("Couldn’t run SQL: {error}"))
+    }
+
     pub(crate) async fn read_table(
         &self,
         database: &str,
