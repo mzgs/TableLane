@@ -12,7 +12,7 @@ use gpui_kit::{
         form::{Field, Form},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         scroll::ScrollableElement,
-        select::{Select, SelectEvent, SelectState},
+        select::{SearchableVec, Select, SelectEvent, SelectState},
         table::{Column, DataTable, TableDelegate, TableEvent, TableState},
         tooltip::Tooltip,
     },
@@ -201,7 +201,7 @@ pub(crate) struct TableView {
     error: Option<String>,
     query: TableQuery,
     loading: bool,
-    filter_column: Option<Entity<SelectState<Vec<String>>>>,
+    filter_column: Option<Entity<SelectState<SearchableVec<String>>>>,
     filter_operator: Option<Entity<SelectState<Vec<String>>>>,
     filter_value: Option<Entity<InputState>>,
     filter_task: Option<Task<()>>,
@@ -357,18 +357,21 @@ impl TableView {
                 if self.filter_column.is_none() {
                     let column = cx.new(|cx| {
                         SelectState::new(
-                            std::iter::once("All columns".to_owned())
-                                .chain(data.schema.columns.clone())
-                                .collect::<Vec<_>>(),
+                            SearchableVec::new(
+                                std::iter::once("All columns".to_owned())
+                                    .chain(data.schema.columns.clone())
+                                    .collect::<Vec<_>>(),
+                            ),
                             Some(component::IndexPath::new(0)),
                             window,
                             cx,
                         )
+                        .searchable(true)
                     });
                     cx.subscribe_in(
                         &column,
                         window,
-                        |view, column, event: &SelectEvent<Vec<String>>, window, cx| {
+                        |view, column, event: &SelectEvent<SearchableVec<String>>, window, cx| {
                             view.filter_task = None;
                             view.filter_pending = false;
                             let SelectEvent::Confirm(name) = event;
@@ -885,6 +888,7 @@ impl Render for TableView {
                                                 Select::new(column)
                                                     .id("filter-column")
                                                     .accessibility_label("Filter column")
+                                                    .search_placeholder("Search columns")
                                                     .small()
                                                     .disabled(busy),
                                             ),
@@ -1169,7 +1173,11 @@ mod tests {
                 ]
             });
             window.within("filter-column").click("input", cx);
-            window.press("down", cx);
+            window.input("id", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
             window.press("enter", cx);
         })
         .unwrap();
