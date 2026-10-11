@@ -5,10 +5,61 @@ use std::collections::BTreeMap;
 const CELL_PREVIEW_CHARS: usize = 200;
 pub(crate) const PAGE_SIZE: usize = 1000;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FilterOperator {
+    Contains,
+    NotContains,
+    Equals,
+    NotEquals,
+    StartsWith,
+    EndsWith,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
+}
+
+impl FilterOperator {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Contains,
+        Self::NotContains,
+        Self::Equals,
+        Self::NotEquals,
+        Self::StartsWith,
+        Self::EndsWith,
+        Self::GreaterThan,
+        Self::GreaterOrEqual,
+        Self::LessThan,
+        Self::LessOrEqual,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Contains => "Contains",
+            Self::NotContains => "Does not contain",
+            Self::Equals => "Equals",
+            Self::NotEquals => "Does not equal",
+            Self::StartsWith => "Starts with",
+            Self::EndsWith => "Ends with",
+            Self::GreaterThan => "Greater than",
+            Self::GreaterOrEqual => "Greater than or equal",
+            Self::LessThan => "Less than",
+            Self::LessOrEqual => "Less than or equal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TableFilter {
+    pub(crate) column: Option<String>,
+    pub(crate) operator: FilterOperator,
+    pub(crate) value: String,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct TableQuery {
     pub(crate) page: usize,
-    pub(crate) filters: Vec<(String, String)>,
+    pub(crate) filters: Vec<TableFilter>,
     pub(crate) sort: Option<(String, bool)>,
 }
 
@@ -21,23 +72,74 @@ impl TableQuery {
             .ok_or("Page is too large.")?;
         let mut predicates = Vec::new();
         let mut values = Vec::new();
-        for (name, value) in &self.filters {
-            let ix = schema
-                .columns
-                .iter()
-                .position(|column| column == name)
-                .ok_or("Filter column is unavailable.")?;
-            predicates.push(format!(
-                "{} LIKE ? ESCAPE '='",
-                schema.expression(ix, false)
-            ));
-            values.push(format!(
-                "%{}%",
-                value
+        for filter in &self.filters {
+            let columns = match &filter.column {
+                Some(name) => vec![
+                    schema
+                        .columns
+                        .iter()
+                        .position(|column| column == name)
+                        .ok_or("Filter column is unavailable.")?,
+                ],
+                None => (0..schema.columns.len()).collect(),
+            };
+            if columns.is_empty() {
+                return Err("Filter column is unavailable.".into());
+            }
+            use FilterOperator::*;
+            let text_match = matches!(
+                filter.operator,
+                Contains | NotContains | StartsWith | EndsWith
+            );
+            let negative = matches!(filter.operator, NotContains | NotEquals);
+            let operator = match filter.operator {
+                Contains | StartsWith | EndsWith => "LIKE ? ESCAPE '='",
+                NotContains => "NOT LIKE ? ESCAPE '='",
+                Equals => "= ?",
+                NotEquals => "<> ?",
+                GreaterThan => "> ?",
+                GreaterOrEqual => ">= ?",
+                LessThan => "< ?",
+                LessOrEqual => "<= ?",
+            };
+            let value = if text_match {
+                let escaped = filter
+                    .value
                     .replace('=', "==")
                     .replace('%', "=%")
-                    .replace('_', "=_")
-            ));
+                    .replace('_', "=_");
+                match filter.operator {
+                    StartsWith => format!("{escaped}%"),
+                    EndsWith => format!("%{escaped}"),
+                    _ => format!("%{escaped}%"),
+                }
+            } else {
+                filter.value.clone()
+            };
+            let mut matches = Vec::new();
+            for ix in columns {
+                // Compare original typed values so numeric comparisons stay numeric.
+                let column = if text_match || schema.is_binary(ix) {
+                    schema.expression(ix, false)
+                } else {
+                    quote_identifier(&schema.columns[ix])
+                };
+                let predicate = format!("{column} {operator}");
+                matches.push(if filter.column.is_none() && negative {
+                    format!("COALESCE({predicate}, TRUE)")
+                } else {
+                    predicate
+                });
+                values.push(value.clone());
+            }
+            predicates.push(if filter.column.is_some() {
+                matches.join(" AND ")
+            } else {
+                format!(
+                    "({})",
+                    matches.join(if negative { " AND " } else { " OR " })
+                )
+            });
         }
         let mut order = Vec::new();
         if let Some((name, descending)) = &self.sort {
@@ -457,6 +559,96 @@ pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> 
 
 #[cfg(test)]
 mod tests {
+    use super::{FilterOperator, TableFilter};
+
+    fn contains(column: &str, value: &str) -> TableFilter {
+        TableFilter {
+            column: Some(column.into()),
+            operator: FilterOperator::Contains,
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn filter_operators_bind_values_and_group_all_columns() {
+        use super::{TableQuery, TableSchema};
+        use FilterOperator::*;
+        let schema = TableSchema {
+            columns: vec!["number".into(), "text".into()],
+            column_types: vec!["int".into(), "text".into()],
+            primary_key: vec![0],
+            ..TableSchema::default()
+        };
+        for (operator, predicate, value) in [
+            (
+                Contains,
+                "CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '='",
+                "%2=%=_==%",
+            ),
+            (
+                NotContains,
+                "CAST(`number` AS CHAR CHARACTER SET utf8mb4) NOT LIKE ? ESCAPE '='",
+                "%2=%=_==%",
+            ),
+            (
+                StartsWith,
+                "CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '='",
+                "2=%=_==%",
+            ),
+            (
+                EndsWith,
+                "CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '='",
+                "%2=%=_==",
+            ),
+            (Equals, "`number` = ?", "2%_="),
+            (NotEquals, "`number` <> ?", "2%_="),
+            (GreaterThan, "`number` > ?", "2%_="),
+            (GreaterOrEqual, "`number` >= ?", "2%_="),
+            (LessThan, "`number` < ?", "2%_="),
+            (LessOrEqual, "`number` <= ?", "2%_="),
+        ] {
+            let query = TableQuery {
+                filters: vec![TableFilter {
+                    column: Some("number".into()),
+                    operator,
+                    value: "2%_=".into(),
+                }],
+                ..TableQuery::default()
+            };
+            let (sql, values, _) = query.clauses(&schema).unwrap();
+            assert_eq!(
+                sql,
+                format!(" WHERE {predicate} ORDER BY `number` ASC LIMIT ? OFFSET ?")
+            );
+            assert_eq!(values, [value]);
+        }
+        let mut query = TableQuery {
+            filters: vec![
+                TableFilter {
+                    column: None,
+                    operator: Contains,
+                    value: "2".into(),
+                },
+                contains("text", "x"),
+            ],
+            ..TableQuery::default()
+        };
+        let (sql, values, _) = query.clauses(&schema).unwrap();
+        assert_eq!(
+            sql,
+            " WHERE (CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' OR CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=') AND CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' ORDER BY `number` ASC LIMIT ? OFFSET ?"
+        );
+        assert_eq!(values, ["%2%", "%2%", "%x%"]);
+        query.filters.truncate(1);
+        query.filters[0].operator = NotEquals;
+        let (sql, values, _) = query.clauses(&schema).unwrap();
+        assert_eq!(
+            sql,
+            " WHERE (COALESCE(`number` <> ?, TRUE) AND COALESCE(`text` <> ?, TRUE)) ORDER BY `number` ASC LIMIT ? OFFSET ?"
+        );
+        assert_eq!(values, ["2", "2"]);
+    }
+
     #[test]
     fn table_queries_bind_literal_filters_validate_columns_and_order_pages() {
         use super::{TableQuery, TableSchema};
@@ -469,8 +661,8 @@ mod tests {
         let query = TableQuery {
             page: 2,
             filters: vec![
-                ("text`value".into(), "a%_=' OR 1=1 --".into()),
-                ("bytes".into(), "00FF".into()),
+                contains("text`value", "a%_=' OR 1=1 --"),
+                contains("bytes", "00FF"),
             ],
             sort: Some(("text`value".into(), true)),
         };
@@ -503,7 +695,7 @@ mod tests {
         );
         assert!(
             TableQuery {
-                filters: vec![("missing".into(), "x".into())],
+                filters: vec![contains("missing", "x")],
                 ..TableQuery::default()
             }
             .clauses(&schema)
@@ -600,10 +792,7 @@ mod tests {
                 .unwrap();
             assert_eq!(ties_next.rows[0][0].as_deref(), Some("2002"));
             query.page = 0;
-            query.filters = vec![
-                ("body".into(), "tail2005".into()),
-                ("category".into(), "1".into()),
-            ];
+            query.filters = vec![contains("body", "tail2005"), contains("category", "1")];
             let filtered = session
                 .read_table("browse_test", "widgets", &query)
                 .await
@@ -626,14 +815,14 @@ mod tests {
                     .unwrap()
                     .ends_with("tail2005")
             );
-            query.filters = vec![("body".into(), "%_=' OR 1=1 --".into())];
+            query.filters = vec![contains("body", "%_=' OR 1=1 --")];
             let literal = session
                 .read_table("browse_test", "widgets", &query)
                 .await
                 .unwrap();
             assert_eq!(literal.rows.len(), 1);
             assert_eq!(literal.rows[0][0].as_deref(), Some("2004"));
-            query.filters = vec![("bytes".into(), "00FF".into())];
+            query.filters = vec![contains("bytes", "00FF")];
             assert!(
                 session
                     .read_table("browse_test", "widgets", &query)
@@ -641,13 +830,50 @@ mod tests {
                     .unwrap()
                     .has_more
             );
-            query.filters = vec![("body".into(), "unmatched".into())];
+            query.filters = vec![contains("body", "unmatched")];
             let empty = session
                 .read_table("browse_test", "widgets", &query)
                 .await
                 .unwrap();
             assert!(empty.rows.is_empty());
             assert!(!empty.has_more);
+            use FilterOperator::*;
+            query.sort = None;
+            for (column, operator, value, count, first_id) in [
+                (Some("id"), GreaterThan, "2000", 5, "2001"),
+                (Some("id"), GreaterOrEqual, "2000", 6, "2000"),
+                (Some("id"), LessThan, "10", 9, "1"),
+                (Some("id"), LessOrEqual, "10", 10, "1"),
+                (Some("id"), Equals, "10", 1, "10"),
+                (Some("body"), NotContains, "tail", 1, "2004"),
+                (Some("body"), StartsWith, "literal%_=", 1, "2004"),
+                (Some("body"), EndsWith, "tail2005", 1, "2005"),
+                (None, Contains, "tail2005", 1, "2005"),
+                (None, NotContains, "tail", 1, "2004"),
+            ] {
+                query.filters = vec![TableFilter {
+                    column: column.map(str::to_owned),
+                    operator,
+                    value: value.into(),
+                }];
+                let result = session
+                    .read_table("browse_test", "widgets", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(result.rows.len(), count, "{column:?} {operator:?}");
+                assert_eq!(result.rows[0][0].as_deref(), Some(first_id));
+                assert!(!result.has_more);
+            }
+            sqlx::query("UPDATE browse_test.widgets SET body = NULL WHERE id = 2005")
+                .execute(&mut *session.connection.lock().await)
+                .await
+                .unwrap();
+            let result = session
+                .read_table("browse_test", "widgets", &query)
+                .await
+                .unwrap();
+            assert_eq!(result.rows.len(), 2);
+            assert_eq!(result.rows[1][0].as_deref(), Some("2005"));
             sqlx::query("DROP DATABASE browse_test")
                 .execute(&mut *session.connection.lock().await)
                 .await

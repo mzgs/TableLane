@@ -1,6 +1,9 @@
 use crate::{
     connections::OpenTable,
-    database::{PAGE_SIZE, TableQuery, TableRows, TableSchema, truncate_preview},
+    database::{
+        FilterOperator, PAGE_SIZE, TableFilter, TableQuery, TableRows, TableSchema,
+        truncate_preview,
+    },
 };
 use gpui_kit::{
     component::{
@@ -8,6 +11,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         form::{Field, Form},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
+        scroll::ScrollableElement,
         select::{Select, SelectEvent, SelectState},
         table::{Column, DataTable, TableDelegate, TableEvent, TableState},
         tooltip::Tooltip,
@@ -198,7 +202,10 @@ pub(crate) struct TableView {
     query: TableQuery,
     loading: bool,
     filter_column: Option<Entity<SelectState<Vec<String>>>>,
+    filter_operator: Option<Entity<SelectState<Vec<String>>>>,
     filter_value: Option<Entity<InputState>>,
+    filter_task: Option<Task<()>>,
+    filter_pending: bool,
 }
 
 impl EventEmitter<TableEvent> for TableView {}
@@ -224,6 +231,8 @@ impl TableView {
         let Some(request) = self.request.clone() else {
             return;
         };
+        self.filter_task = None;
+        self.filter_pending = false;
         self.loading = true;
         self.error = None;
         self.fields.clear();
@@ -257,25 +266,78 @@ impl TableView {
                         cx.notify();
                     }
                 }
+                if view.filter_pending {
+                    view.apply_filter(window, cx);
+                }
             });
         })
         .detach();
         cx.notify();
     }
 
+    fn schedule_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_pending = false;
+        self.filter_task = Some(cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| view.apply_filter(window, cx));
+        }));
+    }
+
     fn apply_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(column), Some(value)) = (&self.filter_column, &self.filter_value) else {
+        self.filter_task = None;
+        self.filter_pending = false;
+        if self.saving || self.is_dirty(cx) {
+            return;
+        }
+        if self.loading {
+            self.filter_pending = true;
+            return;
+        }
+        let (Some(column), Some(operator), Some(value)) = (
+            &self.filter_column,
+            &self.filter_operator,
+            &self.filter_value,
+        ) else {
             return;
         };
-        let Some(name) = column.read(cx).selected_value().cloned() else {
+        let Some(selected) = column.read(cx).selected_index(cx) else {
+            return;
+        };
+        let name = if selected.row == 0 {
+            None
+        } else {
+            column.read(cx).selected_value().cloned()
+        };
+        let label = operator.read(cx).selected_value().cloned();
+        let Some(operator) = FilterOperator::ALL
+            .iter()
+            .copied()
+            .find(|operator| Some(operator.label()) == label.as_deref())
+        else {
             return;
         };
         let value = value.read(cx).value().to_string();
+        let filter = (!value.is_empty()).then(|| TableFilter {
+            column: name.clone(),
+            operator,
+            value,
+        });
+        if self
+            .query
+            .filters
+            .iter()
+            .find(|filter| filter.column == name)
+            == filter.as_ref()
+        {
+            return;
+        }
         let mut query = self.query.clone();
         query.page = 0;
-        query.filters.retain(|(column, _)| column != &name);
-        if !value.is_empty() {
-            query.filters.push((name, value));
+        query.filters.retain(|filter| filter.column != name);
+        if let Some(filter) = filter {
+            query.filters.push(filter);
         }
         self.load(query, window, cx);
     }
@@ -295,7 +357,9 @@ impl TableView {
                 if self.filter_column.is_none() {
                     let column = cx.new(|cx| {
                         SelectState::new(
-                            data.schema.columns.clone(),
+                            std::iter::once("All columns".to_owned())
+                                .chain(data.schema.columns.clone())
+                                .collect::<Vec<_>>(),
                             Some(component::IndexPath::new(0)),
                             window,
                             cx,
@@ -304,15 +368,38 @@ impl TableView {
                     cx.subscribe_in(
                         &column,
                         window,
-                        |view, _, event: &SelectEvent<Vec<String>>, window, cx| {
+                        |view, column, event: &SelectEvent<Vec<String>>, window, cx| {
+                            view.filter_task = None;
+                            view.filter_pending = false;
                             let SelectEvent::Confirm(name) = event;
-                            let value = view
+                            let name = if column
+                                .read(cx)
+                                .selected_index(cx)
+                                .is_some_and(|ix| ix.row == 0)
+                            {
+                                None
+                            } else {
+                                name.clone()
+                            };
+                            let filter = view
                                 .query
                                 .filters
                                 .iter()
-                                .find(|(column, _)| Some(column) == name.as_ref())
-                                .map(|(_, value)| value.clone())
+                                .find(|filter| filter.column == name);
+                            let value = filter
+                                .map(|filter| filter.value.clone())
                                 .unwrap_or_default();
+                            let operator =
+                                filter.map_or(FilterOperator::Contains, |filter| filter.operator);
+                            if let Some(select) = &view.filter_operator {
+                                select.update(cx, |select, cx| {
+                                    select.set_selected_value(
+                                        &operator.label().to_owned(),
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
                             if let Some(input) = &view.filter_value {
                                 input.update(cx, |input, cx| input.set_value(value, window, cx));
                             }
@@ -320,13 +407,33 @@ impl TableView {
                     )
                     .detach();
                     self.filter_column = Some(column);
+                    self.filter_operator = Some(cx.new(|cx| {
+                        SelectState::new(
+                            FilterOperator::ALL
+                                .iter()
+                                .map(|operator| operator.label().to_owned())
+                                .collect::<Vec<_>>(),
+                            Some(component::IndexPath::new(0)),
+                            window,
+                            cx,
+                        )
+                    }));
+                    cx.subscribe_in(
+                        self.filter_operator.as_ref().unwrap(),
+                        window,
+                        |view, _, _: &SelectEvent<Vec<String>>, window, cx| {
+                            view.schedule_filter(window, cx);
+                        },
+                    )
+                    .detach();
                     let input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder("Contains text; empty removes filter")
+                        InputState::new(window, cx).placeholder("Value; empty removes filter")
                     });
                     cx.subscribe_in(&input, window, |view, _, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::PressEnter { .. }) {
-                            view.apply_filter(window, cx);
+                        match event {
+                            InputEvent::Change => view.schedule_filter(window, cx),
+                            InputEvent::PressEnter { .. } => view.apply_filter(window, cx),
+                            _ => {}
                         }
                     })
                     .detach();
@@ -715,7 +822,7 @@ impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if let Some(error) = &self.error {
             Some(error.clone())
-        } else if self.loading || self.table.is_none() {
+        } else if self.table.is_none() {
             Some("Loading table…".to_owned())
         } else {
             None
@@ -755,82 +862,100 @@ impl Render for TableView {
                     ),
             )
             .when_some(
-                self.filter_column.as_ref().zip(self.filter_value.as_ref()),
-                |view, (column, value)| {
+                self.filter_column
+                    .as_ref()
+                    .zip(self.filter_operator.as_ref())
+                    .zip(self.filter_value.as_ref()),
+                |view, ((column, operator), value)| {
                     let busy = self.loading || self.saving || self.is_dirty(cx);
                     view.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .px_3()
-                            .py_2()
-                            .flex_shrink_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(div().text_sm().child("Filter"))
-                                    .child(
-                                        div().w_40().flex_none().child(
-                                            Select::new(column)
-                                                .id("filter-column")
-                                                .accessibility_label("Filter column")
+                        div().id("filter-bar").test_support().flex_shrink_0().child(
+                            div()
+                                .h_10()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_3()
+                                        .py_2()
+                                        .min_w(rems(34.))
+                                        .child(
+                                            div().w_32().flex_none().child(
+                                                Select::new(column)
+                                                    .id("filter-column")
+                                                    .accessibility_label("Filter column")
+                                                    .small()
+                                                    .disabled(busy),
+                                            ),
+                                        )
+                                        .child(
+                                            div().w_48().flex_none().child(
+                                                Select::new(operator)
+                                                    .id("filter-operator")
+                                                    .accessibility_label("Filter operator")
+                                                    .small()
+                                                    .disabled(busy),
+                                            ),
+                                        )
+                                        .child(
+                                            Input::new(value)
+                                                .id("filter-value")
+                                                .aria_label("Filter value")
                                                 .small()
-                                                .disabled(busy),
+                                                .flex_1()
+                                                .min_w_16()
+                                                .disabled(self.saving || self.is_dirty(cx)),
+                                        )
+                                        .child(
+                                            Button::new("apply-filter")
+                                                .small()
+                                                .flex_shrink_0()
+                                                .label("Apply")
+                                                .disabled(self.saving || self.is_dirty(cx))
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    view.apply_filter(window, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("clear-filters")
+                                                .small()
+                                                .flex_shrink_0()
+                                                .outline()
+                                                .label("Clear")
+                                                .accessibility_label("Clear filters")
+                                                .disabled(busy || self.query.filters.is_empty())
+                                                .on_click(cx.listener(|view, _, window, cx| {
+                                                    view.filter_task = None;
+                                                    view.filter_pending = false;
+                                                    let mut query = view.query.clone();
+                                                    query.page = 0;
+                                                    query.filters.clear();
+                                                    if let Some(input) = &view.filter_value {
+                                                        input.update(cx, |input, cx| {
+                                                            input.set_value("", window, cx)
+                                                        });
+                                                    }
+                                                    view.load(query, window, cx);
+                                                })),
                                         ),
-                                    )
-                                    .child(
-                                        Input::new(value)
-                                            .id("filter-value")
-                                            .aria_label("Contains text")
-                                            .small()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .disabled(busy),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("apply-filter")
-                                            .small()
-                                            .label("Apply")
-                                            .disabled(busy)
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                view.apply_filter(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("clear-filters")
-                                            .small()
-                                            .outline()
-                                            .label("Clear filters")
-                                            .disabled(busy || self.query.filters.is_empty())
-                                            .on_click(cx.listener(|view, _, window, cx| {
-                                                let mut query = view.query.clone();
-                                                query.page = 0;
-                                                query.filters.clear();
-                                                if let Some(input) = &view.filter_value {
-                                                    input.update(cx, |input, cx| {
-                                                        input.set_value("", window, cx)
-                                                    });
-                                                }
-                                                view.load(query, window, cx);
-                                            })),
-                                    ),
-                            ),
+                                )
+                                .overflow_x_scrollbar(),
+                        ),
                     )
                     .when(!self.query.filters.is_empty(), |view| {
                         let summary = self
                             .query
                             .filters
                             .iter()
-                            .map(|(column, value)| format!("{column} contains {value:?}"))
+                            .map(|filter| {
+                                format!(
+                                    "{} {} {:?}",
+                                    filter.column.as_deref().unwrap_or("All columns"),
+                                    filter.operator.label().to_lowercase(),
+                                    filter.value
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join(" · ");
                         let tooltip_summary = summary.clone();
@@ -863,7 +988,7 @@ impl Render for TableView {
                         .px_3()
                         .py_2()
                         .flex_shrink_0()
-                        .when(self.loading, |status| status.flex_1())
+                        .when(self.table.is_none(), |status| status.flex_1())
                         .text_sm()
                         .text_color(if self.error.is_some() {
                             cx.theme().danger
@@ -874,16 +999,14 @@ impl Render for TableView {
                 )
             })
             .when_some(self.table.as_ref(), |view, table| {
-                view.when(!self.loading, |view| {
-                    view.child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .pl_3()
-                            .child(DataTable::new(table).small().bordered(false).stripe(true)),
-                    )
-                })
+                view.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .pl_3()
+                        .child(DataTable::new(table).small().bordered(false).stripe(true)),
+                )
                 .child({
                     let data = &table.read(cx).delegate().data;
                     let busy = self.loading || self.saving || self.is_dirty(cx);
@@ -973,6 +1096,191 @@ mod tests {
             .find(|field| field.name.as_ref() == name)
             .map(|field| ("input", field.input.entity_id()).into())
             .unwrap_or_else(|| SharedString::from(format!("row-field-{name}")).into())
+    }
+
+    #[gpui_kit::test]
+    fn filter_controls_restore_conditions_and_debounce_live_search(cx: &mut TestAppContext) {
+        use crate::database::{FilterOperator, TableFilter};
+        cx.update(gpui_kit::init);
+        let mut view = None;
+        let handle = cx.open_window(size(px(600.), px(500.)), |window, cx| {
+            let entity = cx.new(|_| TableView::default());
+            entity.update(cx, |view, cx| {
+                view.finish(
+                    Ok(TableRows {
+                        schema: TableSchema {
+                            columns: vec!["id".into()],
+                            column_types: vec!["int".into()],
+                            ..TableSchema::default()
+                        },
+                        rows: vec![],
+                        keys: vec![],
+                        has_more: false,
+                    }),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("filter-column").value(), Some("All columns"));
+            assert_eq!(window.find("filter-operator").value(), Some("Contains"));
+            let column = window.find("filter-column").bounds();
+            for id in [
+                "filter-operator",
+                "filter-value",
+                "apply-filter",
+                "clear-filters",
+            ] {
+                let control = window.find(id).bounds();
+                assert_eq!(control.top(), column.top());
+                assert_eq!(control.bottom(), column.bottom());
+                assert!(control.right() <= window.find("filter-bar").bounds().right());
+            }
+            assert!(window.find("filter-value").bounds().size.width >= window.rem_size() * 4.);
+            window.within("filter-operator").click("input", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("filter-operator").value(),
+                Some("Does not contain")
+            );
+            view.update(cx, |view, _| {
+                view.query.filters = vec![
+                    TableFilter {
+                        column: None,
+                        operator: FilterOperator::NotContains,
+                        value: "hidden".into(),
+                    },
+                    TableFilter {
+                        column: Some("id".into()),
+                        operator: FilterOperator::GreaterThan,
+                        value: "10".into(),
+                    },
+                ]
+            });
+            window.within("filter-column").click("input", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("filter-column").value(), Some("id"));
+            assert_eq!(window.find("filter-operator").value(), Some("Greater than"));
+            assert_eq!(window.find("filter-value").value(), Some("10"));
+            window.within("filter-column").click("input", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("filter-column").value(), Some("All columns"));
+            assert_eq!(
+                window.find("filter-operator").value(),
+                Some("Does not contain")
+            );
+            assert_eq!(window.find("filter-value").value(), Some("hidden"));
+            view.update(cx, |view, cx| {
+                view.loading = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.within("filter-operator").click("input", cx);
+            assert_eq!(window.find("filter-operator").expanded(), Some(false));
+            window.click("filter-value", cx);
+            window.press("secondary-a", cx);
+            window.input("n", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(299));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!view.read(cx).filter_pending);
+            window.input("ew", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(299));
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!view.read(cx).filter_pending));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(view.read(cx).filter_pending);
+            assert_eq!(window.find("filter-value").value(), Some("new"));
+            window.input("est", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!view.read(cx).filter_pending);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(view.read(cx).filter_pending);
+            assert!(view.read(cx).filter_task.is_none());
+            assert_eq!(window.find("filter-value").value(), Some("newest"));
+            view.update(cx, |view, cx| {
+                view.loading = false;
+                cx.notify();
+            });
+            window.click("clear-filters", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!view.read(cx).filter_pending);
+            assert!(view.read(cx).filter_task.is_none());
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("filter-value", cx);
+            window.input("blocked", cx);
+            view.update(cx, |view, cx| {
+                view.set_fields(
+                    &TableSchema {
+                        columns: vec!["id".into()],
+                        column_types: vec!["int".into()],
+                        ..TableSchema::default()
+                    },
+                    vec![Some("1".into())],
+                    window,
+                    cx,
+                );
+                view.fields[0]
+                    .input
+                    .update(cx, |input, cx| input.set_value("2", window, cx));
+                view.loading = true;
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(view.read(cx).is_dirty(cx));
+            assert!(!view.read(cx).filter_pending);
+            assert!(view.read(cx).filter_task.is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -1220,7 +1528,6 @@ mod tests {
             window.click("filter-value", cx);
             window.input("1002", cx);
             assert_eq!(window.find("filter-value").value(), Some("1002"));
-            window.press("enter", cx);
         })
         .unwrap();
         cx.wait_for(handle.into(), timeout, |_, cx| {
@@ -1245,6 +1552,11 @@ mod tests {
                     .rows[0][0]
                     .as_deref(),
                 Some("1002")
+            );
+            window.scroll(
+                "filter-bar",
+                ScrollDelta::Pixels(point(px(-600.), px(0.))),
+                cx,
             );
             window.click("clear-filters", cx);
         })
@@ -1327,6 +1639,11 @@ mod tests {
             window.click("filter-value", cx);
             window.press("secondary-a", cx);
             window.input("unmatched", cx);
+            window.scroll(
+                "filter-bar",
+                ScrollDelta::Pixels(point(px(-600.), px(0.))),
+                cx,
+            );
             window.click("apply-filter", cx);
         })
         .unwrap();
@@ -1365,7 +1682,11 @@ mod tests {
             assert!(view.read(cx).table.is_some());
             assert_eq!(
                 view.read(cx).query.filters,
-                [("id".into(), "unmatched".into())]
+                [crate::database::TableFilter {
+                    column: None,
+                    operator: crate::database::FilterOperator::Contains,
+                    value: "unmatched".into()
+                }]
             );
         })
         .unwrap();
@@ -1592,6 +1913,20 @@ mod tests {
             let kind = window.find("column-type-id").bounds();
             let header = window.find(("col-header", 0_usize)).bounds();
             let grid = window.find("table").bounds();
+            view.update(cx, |view, cx| {
+                view.loading = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("table-status").is_none());
+            assert!(window.find("table").visible());
+            assert_eq!(window.find("table").bounds(), grid);
+            assert_eq!(window.find(("col-header", 0_usize)).bounds(), header);
+            view.update(cx, |view, cx| {
+                view.loading = false;
+                cx.notify();
+            });
+            window.render_frame(cx);
             assert_eq!(grid.left(), window.rem_size() * 0.75);
             assert_eq!(grid.right(), px(800.));
             assert_eq!(header.left(), grid.left());
