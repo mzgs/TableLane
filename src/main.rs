@@ -1,5 +1,6 @@
 mod connection_dialog;
 mod connections;
+mod data_export;
 mod database;
 mod schema_view;
 mod settings;
@@ -7,6 +8,7 @@ mod settings_view;
 mod sql_editor;
 mod table_view;
 mod window_state;
+mod workspace_state;
 
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, TitleBar, WindowExt,
@@ -21,6 +23,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use settings::Settings;
 use window_state::WindowState;
+use workspace_state::{WorkspaceFile, WorkspaceState};
 
 gpui_kit::assets::icon_assets!(
     SettingsIcons,
@@ -71,7 +74,7 @@ impl WorkspaceTab {
     fn request<'a>(&'a self, cx: &'a App) -> Option<&'a connections::OpenTable> {
         match self {
             Self::Table(table) => table.read(cx).request(),
-            Self::Sql(editor, _) => Some(editor.read(cx).request()),
+            Self::Sql(editor, _) => editor.read(cx).request(),
             Self::Structure(view) => Some(view.read(cx).request()),
         }
     }
@@ -100,11 +103,10 @@ impl WorkspaceTab {
             ),
             Self::Sql(editor, number) => {
                 let view = editor.read(cx);
-                let request = view.request();
                 format!(
                     "{} / {} / SQL {number}{}",
-                    request.connection_name,
-                    request.database,
+                    view.connection_name(),
+                    view.database(),
                     if view.is_running() {
                         " · Running"
                     } else if view.has_draft(cx) {
@@ -131,6 +133,8 @@ struct AppView {
     settings_path: Option<std::path::PathBuf>,
     window_path: Option<std::path::PathBuf>,
     window_state: WindowState,
+    workspace: WorkspaceFile,
+    workspace_task: Option<Task<()>>,
 }
 
 impl AppView {
@@ -153,20 +157,27 @@ impl AppView {
         window_state.update(window);
         cx.observe_window_bounds(window, |view, window, _| view.window_state.update(window))
             .detach();
-        cx.on_app_quit(|view, _| {
+        cx.on_app_quit(|view, cx| {
+            view.save_workspace(cx);
             view.save_window_state();
             async {}
         })
         .detach();
         let weak = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = weak.update(cx, |view, _| {
+            weak.update(cx, |view, cx| {
                 view.window_state.update(window);
                 view.save_window_state();
-            });
-            true
+                view.prepare_sql_close(false, window, cx)
+            })
+            .unwrap_or(true)
         });
         let connections = cx.new(connections::Connections::new);
+        cx.observe(&connections, |view, _, cx| {
+            view.attach_restored_sessions(cx);
+            cx.notify();
+        })
+        .detach();
         cx.subscribe_in(
             &connections,
             window,
@@ -175,7 +186,12 @@ impl AppView {
             },
         )
         .detach();
-        Self {
+        let (workspace, saved) = WorkspaceFile::load(
+            settings_path
+                .as_ref()
+                .map(|path| path.with_file_name("workspace.json")),
+        );
+        let mut view = Self {
             connections,
             tabs: Vec::new(),
             active_tab: 0,
@@ -188,7 +204,110 @@ impl AppView {
             settings_path,
             window_path,
             window_state,
+            workspace,
+            workspace_task: None,
+        };
+        for draft in saved.tabs {
+            let number = draft.number;
+            let editor = cx.new(|cx| sql_editor::SqlEditor::restore(draft, window, cx));
+            view.observe_sql(&editor, cx);
+            view.tabs.push(WorkspaceTab::Sql(editor, number));
+            view.next_sql_number = view.next_sql_number.max(number.saturating_add(1));
         }
+        view.select_tab(saved.active, window, cx);
+        view
+    }
+
+    fn capture_workspace(&self, cx: &App) -> WorkspaceState {
+        let mut state = WorkspaceState::default();
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            if let WorkspaceTab::Sql(editor, number) = tab {
+                if ix == self.active_tab {
+                    state.active = state.tabs.len();
+                }
+                let mut draft = editor.read(cx).draft(cx);
+                draft.number = *number;
+                state.tabs.push(draft);
+            }
+        }
+        state
+    }
+
+    fn save_workspace(&mut self, cx: &mut Context<Self>) -> bool {
+        self.workspace_task = None;
+        let state = self.capture_workspace(cx);
+        let saved = self.workspace.save(&state);
+        cx.notify();
+        saved
+    }
+
+    fn schedule_workspace_save(&mut self, cx: &mut Context<Self>) {
+        self.workspace_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.save_workspace(cx);
+            });
+        }));
+    }
+
+    fn observe_sql(&self, editor: &Entity<sql_editor::SqlEditor>, cx: &mut Context<Self>) {
+        cx.observe(editor, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(editor, |view, _, _: &sql_editor::DraftChanged, cx| {
+            view.schedule_workspace_save(cx)
+        })
+        .detach();
+    }
+
+    fn attach_restored_sessions(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let WorkspaceTab::Sql(editor, _) = tab
+                && editor.read(cx).request().is_none()
+                && let Some((session, name)) = self
+                    .connections
+                    .read(cx)
+                    .session_for(editor.read(cx).connection_key())
+            {
+                editor.update(cx, |editor, cx| editor.attach(session, name, cx));
+            }
+        }
+    }
+
+    fn prepare_sql_close(
+        &mut self,
+        quitting: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.save_workspace(cx)
+            || !self
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab, WorkspaceTab::Sql(..)))
+        {
+            return true;
+        }
+        if window.has_active_dialog(cx) {
+            return false;
+        }
+        let error = self.workspace.error().cloned().unwrap_or_default();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            dialog
+                .confirm()
+                .title("Close without saved SQL drafts?")
+                .description(format!("{error} Closing can lose the latest SQL drafts."))
+                .ok_text("Close without saving")
+                .on_ok(move |_, window, cx| {
+                    if quitting {
+                        cx.quit();
+                    } else {
+                        window.remove_window();
+                    }
+                    true
+                })
+        });
+        false
     }
 
     fn save_window_state(&self) {
@@ -236,6 +355,7 @@ impl AppView {
             return;
         }
         self.active_tab = ix;
+        self.schedule_workspace_save(cx);
         self.tab_scroll.scroll_to_item(ix);
         self.focus.focus(window, cx);
         match &self.tabs[ix] {
@@ -300,10 +420,10 @@ impl AppView {
         if let Some(sql) = sql {
             editor.update(cx, |editor, cx| editor.set_sql(sql, window, cx));
         }
-        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        self.observe_sql(&editor, cx);
         self.tabs
             .push(WorkspaceTab::Sql(editor, self.next_sql_number));
-        self.next_sql_number += 1;
+        self.next_sql_number = self.next_sql_number.saturating_add(1);
         self.select_tab(self.tabs.len() - 1, window, cx);
     }
 
@@ -412,6 +532,7 @@ impl AppView {
         } else {
             self.focus.focus(window, cx);
         }
+        self.save_workspace(cx);
         cx.notify();
     }
 }
@@ -451,6 +572,32 @@ impl Render for AppView {
                                         );
                                     })),
                             )
+                            .child(
+                                Button::new("edit-connection")
+                                    .ghost()
+                                    .label("Edit connection…")
+                                    .w_full()
+                                    .disabled(
+                                        self.settings_path.is_none()
+                                            || self
+                                                .connections
+                                                .read(cx)
+                                                .selected_connection(cx)
+                                                .is_none(),
+                                    )
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        if let Some(ix) =
+                                            view.connections.read(cx).selected_connection(cx)
+                                        {
+                                            connection_dialog::edit(
+                                                view.settings_path.clone(),
+                                                ix,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            )
                             .child(div().flex_1().min_h_0().child(self.connections.clone())),
                     ),
             )
@@ -465,6 +612,38 @@ impl Render for AppView {
                         .bg(cx.theme().background)
                         .flex()
                         .flex_col()
+                        .when_some(self.workspace.error(), |content, error| {
+                            content.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("workspace-error")
+                                            .test_support()
+                                            .role(Role::Status)
+                                            .aria_label(error.clone())
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .text_color(cx.theme().danger)
+                                            .child(error.clone()),
+                                    )
+                                    .child(
+                                        Button::new("retry-workspace-save")
+                                            .small()
+                                            .label("Retry autosave")
+                                            .disabled(self.workspace.is_readonly())
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.save_workspace(cx);
+                                            })),
+                                    ),
+                            )
+                        })
                         .when(!self.tabs.is_empty(), |content| {
                             content.child(
                                 TabBar::new("workspace-tabs")
@@ -548,7 +727,9 @@ impl Render for AppView {
                             div()
                                 .size_full()
                                 .when_some(self.table(), |sidebar, table| {
-                                    sidebar.child(table.read(cx).render_sidebar(cx))
+                                    sidebar.child(
+                                        table.update(cx, |table, cx| table.render_sidebar(cx)),
+                                    )
                                 })
                                 .overflow_y_scrollbar(),
                         ),
@@ -788,8 +969,10 @@ fn main() {
         window_handle.set(Some(handle));
         #[cfg(debug_assertions)]
         _view.update(cx, |view, cx| {
-            view.connections
-                .update(cx, |connections, cx| connections.open_debug_table(cx));
+            if view.tabs.is_empty() {
+                view.connections
+                    .update(cx, |connections, cx| connections.open_debug_table(cx));
+            }
         });
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
@@ -799,7 +982,19 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             KeyBinding::new("ctrl-,", OpenSettings, None),
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        let quit_view = _view.downgrade();
+        cx.on_action(move |_: &Quit, cx| {
+            let quit_view = quit_view.clone();
+            cx.defer(move |cx| {
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    let _ = quit_view.update(cx, |view, cx| {
+                        if view.prepare_sql_close(true, window, cx) {
+                            cx.quit();
+                        }
+                    });
+                });
+            });
+        });
         settings_view::register_action(handle, settings_path, startup_error.clone(), cx);
         cx.set_menus(vec![Menu {
             name: env!("CARGO_PKG_NAME").into(),
@@ -828,6 +1023,196 @@ mod tests {
         point, px, size,
         test::TestWindowExt,
     };
+
+    #[gpui_kit::test]
+    fn sql_workspace_recovers_offline_autosaves_edits_and_keeps_failed_saves(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{
+            settings::{Connection, DatabaseKind, Settings},
+            workspace_state::{SqlDraft, WorkspaceFile, WorkspaceState},
+        };
+        let directory =
+            std::env::temp_dir().join(format!("tablelane-workspace-ui-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.json");
+        let config = Connection {
+            name: "Local".into(),
+            database_type: DatabaseKind::MariaDB,
+            host: "127.0.0.1".into(),
+            port: Some(3306),
+            username: "root".into(),
+            password: "never-write-this-password".into(),
+            database: String::new(),
+            file_path: String::new(),
+        };
+        let mut state = WorkspaceState::default();
+        state.tabs = vec![
+            SqlDraft {
+                number: 2,
+                connection_key: config.key(),
+                connection_name: config.name.clone(),
+                database: "offline".into(),
+                table: "widgets".into(),
+                sql: "SELECT '世界';\n-- draft\n".into(),
+            },
+            SqlDraft {
+                number: 7,
+                connection_key: config.key(),
+                connection_name: config.name.clone(),
+                database: "offline".into(),
+                table: "widgets".into(),
+                sql: "UPDATE widgets SET name = 'unfinished'".into(),
+            },
+        ];
+        state.active = 1;
+        assert!(WorkspaceFile::load(Some(path.clone())).0.save(&state));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings {
+                connections: vec![config.clone()],
+                ..Settings::default()
+            });
+        });
+        let mut app = None;
+        let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(app.read(cx).tabs.len(), 2);
+            assert_eq!(app.read(cx).active_tab, 1);
+            assert_eq!(app.read(cx).next_sql_number, 8);
+            assert_eq!(
+                window.within("workspace-tabs").find(1_usize).label(),
+                Some("Local / offline / SQL 7 · Draft")
+            );
+            assert!(window.find("sql-offline").visible());
+            window.click("run-sql", cx);
+            window.press("cmd-enter", cx);
+            let super::WorkspaceTab::Sql(editor, _) = &app.read(cx).tabs[1] else {
+                panic!("SQL tab missing")
+            };
+            assert!(!editor.read(cx).is_running());
+            assert!(editor.read(cx).request().is_none());
+            window.press("ctrl-shift-tab", cx);
+            assert_eq!(app.read(cx).active_tab, 0);
+            window.press("secondary-a", cx);
+            window.input("SELECT '保存';\n-- still a draft", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(299));
+        cx.run_until_parked();
+        assert_eq!(WorkspaceFile::load(Some(path.clone())).1, state);
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        let saved = WorkspaceFile::load(Some(path.clone())).1;
+        assert_eq!(saved.active, 0);
+        assert_eq!(saved.tabs[0].sql, "SELECT '保存';\n-- still a draft");
+        assert_eq!(saved.tabs[1].sql, state.tabs[1].sql);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&config.password)
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("cmd-w", cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(app.read(cx).tabs.len(), 2);
+            window.press("cmd-w", cx);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let saved = WorkspaceFile::load(Some(path.clone())).1;
+        assert_eq!(saved.tabs.len(), 1);
+        assert_eq!(saved.tabs[0].number, 7);
+        let original = std::fs::read(&path).unwrap();
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::create_dir(&temporary).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("secondary-a", cx);
+            window.input("SELECT 'latest unsaved'", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("workspace-error")
+                    .label()
+                    .unwrap()
+                    .contains("Couldn’t save SQL drafts")
+            );
+        })
+        .unwrap();
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle.into(), cx);
+        assert!(!visual.simulate_close());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("escape", cx);
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir(&temporary).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("retry-workspace-save", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            WorkspaceFile::load(Some(path.clone())).1.tabs[0].sql,
+            "SELECT 'latest unsaved'"
+        );
+        // A fresh application view restores the file, with no connection or SQL execution.
+        let restored = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            assert_eq!(view.read(cx).tabs.len(), 1);
+            assert_eq!(
+                view.read(cx).capture_workspace(cx).tabs[0].sql,
+                "SELECT 'latest unsaved'"
+            );
+            Root::new(view, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update_window(restored.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("sql-offline").visible());
+        })
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(debug_assertions)]
     #[gpui_kit::test]

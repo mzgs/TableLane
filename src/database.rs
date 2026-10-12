@@ -1,4 +1,7 @@
-use crate::settings::{Connection, DatabaseKind};
+use crate::{
+    data_export::{ExportFormat, ExportWriter, QueryExport},
+    settings::{Connection, DatabaseKind},
+};
 use sqlx::{Column as _, Connection as _, Executor as _, MySqlConnection, Row, TypeInfo as _};
 use std::collections::BTreeMap;
 
@@ -170,7 +173,7 @@ impl TableQuery {
             format!(" WHERE {}", predicates.join(" AND "))
         };
         Ok((
-            format!("{filter} ORDER BY {} LIMIT ? OFFSET ?", order.join(", ")),
+            format!("{filter} ORDER BY {}", order.join(", ")),
             values,
             offset,
         ))
@@ -178,6 +181,7 @@ impl TableQuery {
 }
 
 pub(crate) struct Session {
+    connection_key: String,
     connection: async_std::sync::Mutex<MySqlConnection>,
     pub(crate) databases: BTreeMap<String, Vec<String>>,
 }
@@ -335,7 +339,76 @@ pub(crate) fn truncate_preview(mut value: String) -> String {
     value
 }
 
+fn sql_values(
+    row: &sqlx::mysql::MySqlRow,
+    preview: bool,
+) -> Result<Vec<Option<String>>, sqlx::Error> {
+    (0..row.len())
+        .map(|ix| {
+            let bytes = row.try_get_unchecked::<Option<&[u8]>, _>(ix)?;
+            bytes
+                .map(|bytes| -> Result<String, sqlx::Error> {
+                    let kind = row.columns()[ix].type_info().name();
+                    if kind.contains("BLOB")
+                        || kind.contains("BINARY")
+                        || matches!(kind, "BIT" | "GEOMETRY")
+                    {
+                        let mut value = bytes
+                            .iter()
+                            .take(if preview { 100 } else { bytes.len() })
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<String>();
+                        if preview && bytes.len() > 100 {
+                            value.push('…');
+                        }
+                        Ok(value)
+                    } else if preview {
+                        Ok(truncate_preview(
+                            String::from_utf8_lossy(bytes).into_owned(),
+                        ))
+                    } else {
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+                    }
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+async fn read_schema(
+    connection: &mut MySqlConnection,
+    database: &str,
+    table: &str,
+) -> Result<TableSchema, sqlx::Error> {
+    let metadata = sqlx::query(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            ).bind(database).bind(table).fetch_all(&mut *connection).await?;
+    let mut schema = TableSchema::default();
+    for column in metadata {
+        let ix = schema.columns.len();
+        schema.columns.push(column.try_get(0)?);
+        schema.column_types.push(column.try_get(1)?);
+        if column.try_get::<String, _>(2)? == "PRI" {
+            schema.primary_key.push(ix);
+        }
+        if column.try_get::<String, _>(3)?.contains("GENERATED") {
+            schema.generated_columns.push(ix);
+        }
+    }
+    if schema.columns.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "Table is unavailable or has no accessible columns.".into(),
+        ));
+    }
+    Ok(schema)
+}
+
 impl Session {
+    pub(crate) fn connection_key(&self) -> &str {
+        &self.connection_key
+    }
+
     pub(crate) async fn read_structure(
         &self,
         database: &str,
@@ -368,6 +441,32 @@ impl Session {
         database: &str,
         sql: &str,
     ) -> Result<(TableRows, u64), String> {
+        self.run_sql_capture(database, sql, None).await
+    }
+
+    pub(crate) async fn run_sql_export(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<(TableRows, u64, QueryExport), String> {
+        let mut export = QueryExport::new().map_err(|error| {
+            format!("Couldn’t prepare result export: {error}. SQL was not executed.")
+        })?;
+        let (data, affected) = self
+            .run_sql_capture(database, sql, Some(&mut export))
+            .await?;
+        export
+            .finish()
+            .map_err(|error| format!("SQL completed, but saving full results failed: {error}."))?;
+        Ok((data, affected, export))
+    }
+
+    async fn run_sql_capture(
+        &self,
+        database: &str,
+        sql: &str,
+        mut capture: Option<&mut QueryExport>,
+    ) -> Result<(TableRows, u64), String> {
         use async_std::stream::StreamExt;
         if sql.trim().is_empty() {
             return Err("Enter a SQL statement to run.".into());
@@ -398,6 +497,10 @@ impl Session {
                 keys: Vec::new(),
                 has_more: false,
             };
+            if let Some(export) = capture.as_deref_mut() {
+                export.set_columns(&data.schema.columns);
+            }
+            let mut capture_error = None;
             let mut affected = 0;
             // shortcut: only the first result set is displayed; add a result selector when needed for stored procedures.
             let mut first_result = true;
@@ -421,40 +524,34 @@ impl Session {
                                 .map(|column| column.type_info().name().to_owned())
                                 .collect();
                         }
+                        if let Some(export) = capture.as_deref_mut() {
+                            if data.rows.is_empty() {
+                                export.set_columns(&data.schema.columns);
+                            }
+                            if capture_error.is_none() {
+                                let result = sql_values(&row, false)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|values| export.push(&values));
+                                if let Err(error) = result {
+                                    capture_error = Some(error);
+                                }
+                            }
+                        }
                         if data.rows.len() == PAGE_SIZE {
                             data.has_more = true;
                             continue;
                         }
-                        let values = (0..row.len())
-                            .map(|ix| {
-                                let bytes = row.try_get_unchecked::<Option<&[u8]>, _>(ix)?;
-                                Ok(bytes.map(|bytes| {
-                                    let kind = row.columns()[ix].type_info().name();
-                                    if kind.contains("BLOB")
-                                        || kind.contains("BINARY")
-                                        || matches!(kind, "BIT" | "GEOMETRY")
-                                    {
-                                        let mut value = bytes
-                                            .iter()
-                                            .take(100)
-                                            .map(|byte| format!("{byte:02X}"))
-                                            .collect::<String>();
-                                        if bytes.len() > 100 {
-                                            value.push('…');
-                                        }
-                                        value
-                                    } else {
-                                        truncate_preview(
-                                            String::from_utf8_lossy(bytes).into_owned(),
-                                        )
-                                    }
-                                }))
-                            })
-                            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+                        let values = sql_values(&row, true)?;
                         data.rows.push(values);
                     }
                     _ => {}
                 }
+            }
+            // Drain the stream even if the disk fills, leaving the shared session usable.
+            if let Some(error) = capture_error {
+                return Err(sqlx::Error::Protocol(format!(
+                    "SQL completed, but saving full results failed: {error}."
+                )));
             }
             Ok::<_, sqlx::Error>((data, affected))
         }
@@ -470,35 +567,113 @@ impl Session {
     ) -> Result<TableRows, String> {
         async_std::future::timeout(std::time::Duration::from_secs(15), async {
             let mut connection = self.connection.lock().await;
-            let metadata = sqlx::query(
-                "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
-            ).bind(database).bind(table).fetch_all(&mut *connection).await?;
-            let mut schema = TableSchema::default();
-            for column in metadata {
-                let ix = schema.columns.len();
-                schema.columns.push(column.try_get(0)?);
-                schema.column_types.push(column.try_get(1)?);
-                if column.try_get::<String, _>(2)? == "PRI" { schema.primary_key.push(ix); }
-                if column.try_get::<String, _>(3)?.contains("GENERATED") { schema.generated_columns.push(ix); }
-            }
-            if schema.columns.is_empty() {
-                return Err(sqlx::Error::Protocol("Table is unavailable or has no accessible columns.".into()));
-            }
-            let mut expressions = (0..schema.columns.len()).map(|ix| schema.expression(ix, true)).collect::<Vec<_>>();
-            expressions.extend(schema.primary_key.iter().map(|ix| schema.expression(*ix, false)));
-            let (clauses, values, offset) = options.clauses(&schema).map_err(sqlx::Error::Protocol)?;
-            let query = format!("SELECT {} FROM {}.{}{clauses}", expressions.join(", "), quote_identifier(database), quote_identifier(table));
+            let schema = read_schema(&mut connection, database, table).await?;
+            let mut expressions = (0..schema.columns.len())
+                .map(|ix| schema.expression(ix, true))
+                .collect::<Vec<_>>();
+            expressions.extend(
+                schema
+                    .primary_key
+                    .iter()
+                    .map(|ix| schema.expression(*ix, false)),
+            );
+            let (clauses, values, offset) =
+                options.clauses(&schema).map_err(sqlx::Error::Protocol)?;
+            let query = format!(
+                "SELECT {} FROM {}.{}{clauses} LIMIT ? OFFSET ?",
+                expressions.join(", "),
+                quote_identifier(database),
+                quote_identifier(table)
+            );
             let mut statement = sqlx::query(&query);
-            for value in values { statement = statement.bind(value); }
-            let mut records = statement.bind((PAGE_SIZE + 1) as u64).bind(offset).fetch_all(&mut *connection).await?;
+            for value in values {
+                statement = statement.bind(value);
+            }
+            let mut records = statement
+                .bind((PAGE_SIZE + 1) as u64)
+                .bind(offset)
+                .fetch_all(&mut *connection)
+                .await?;
             let has_more = records.len() > PAGE_SIZE;
             records.truncate(PAGE_SIZE);
-            let rows = records.iter().map(|row| (0..schema.columns.len()).map(|ix| row.try_get::<Option<String>, _>(ix).map(|value| value.map(truncate_preview))).collect())
+            let rows = records
+                .iter()
+                .map(|row| {
+                    (0..schema.columns.len())
+                        .map(|ix| {
+                            row.try_get::<Option<String>, _>(ix)
+                                .map(|value| value.map(truncate_preview))
+                        })
+                        .collect()
+                })
                 .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
-            let keys = records.iter().map(|row| (schema.columns.len()..expressions.len()).map(|ix| row.try_get::<Option<String>, _>(ix)).collect()).collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
-            Ok::<_, sqlx::Error>(TableRows { schema, rows, keys, has_more })
-        }).await.map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
-            .map_err(|error| format!("Couldn’t load table: {error}. Double-click the table to try again."))
+            let keys = records
+                .iter()
+                .map(|row| {
+                    (schema.columns.len()..expressions.len())
+                        .map(|ix| row.try_get::<Option<String>, _>(ix))
+                        .collect()
+                })
+                .collect::<Result<Vec<Vec<Option<String>>>, sqlx::Error>>()?;
+            Ok::<_, sqlx::Error>(TableRows {
+                schema,
+                rows,
+                keys,
+                has_more,
+            })
+        })
+        .await
+        .map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
+        .map_err(|error| {
+            format!("Couldn’t load table: {error}. Double-click the table to try again.")
+        })
+    }
+
+    pub(crate) async fn export_table(
+        &self,
+        database: &str,
+        table: &str,
+        options: &TableQuery,
+        path: &std::path::Path,
+        format: ExportFormat,
+    ) -> anyhow::Result<usize> {
+        use async_std::stream::StreamExt;
+        let mut connection = self.connection.lock().await;
+        let schema = read_schema(&mut connection, database, table).await?;
+        let (clauses, values, _) = options.clauses(&schema).map_err(anyhow::Error::msg)?;
+        let expressions = (0..schema.columns.len())
+            .map(|ix| schema.expression(ix, false))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT {} FROM {}.{}{clauses}",
+            expressions.join(", "),
+            quote_identifier(database),
+            quote_identifier(table)
+        );
+        let mut statement = sqlx::query(&sql);
+        for value in values {
+            statement = statement.bind(value);
+        }
+        let mut writer = ExportWriter::new(path, format, &schema.columns)?;
+        let mut write_error = None;
+        let mut stream = statement.fetch(&mut *connection);
+        while let Some(row) = stream.next().await {
+            let row = row?;
+            if write_error.is_none() {
+                let result = (0..schema.columns.len())
+                    .map(|ix| row.try_get(ix))
+                    .collect::<Result<Vec<Option<String>>, sqlx::Error>>()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|values| writer.push(&values));
+                if let Err(error) = result {
+                    write_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = write_error {
+            return Err(error);
+        }
+        writer.finish(path)
     }
 
     pub(crate) async fn read_row(
@@ -705,7 +880,7 @@ pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> 
                 tables.push(row.try_get(1)?);
             }
         }
-        Ok::<_, sqlx::Error>(Session { connection: async_std::sync::Mutex::new(session), databases })
+        Ok::<_, sqlx::Error>(Session { connection_key: connection.key(), connection: async_std::sync::Mutex::new(session), databases })
     }).await.map_err(|_| "Connection timed out. Check the host and port, then try again.".to_owned())?
         .map_err(|error| format!("Couldn’t connect or load databases: {error}"))
 }
@@ -769,10 +944,7 @@ mod tests {
                 ..TableQuery::default()
             };
             let (sql, values, _) = query.clauses(&schema).unwrap();
-            assert_eq!(
-                sql,
-                format!(" WHERE {predicate} ORDER BY `number` ASC LIMIT ? OFFSET ?")
-            );
+            assert_eq!(sql, format!(" WHERE {predicate} ORDER BY `number` ASC"));
             assert_eq!(values, [value]);
         }
         let mut query = TableQuery {
@@ -789,7 +961,7 @@ mod tests {
         let (sql, values, _) = query.clauses(&schema).unwrap();
         assert_eq!(
             sql,
-            " WHERE (CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' OR CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=') AND CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' ORDER BY `number` ASC LIMIT ? OFFSET ?"
+            " WHERE (CAST(`number` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' OR CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=') AND CAST(`text` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' ORDER BY `number` ASC"
         );
         assert_eq!(values, ["%2%", "%2%", "%x%"]);
         query.filters.truncate(1);
@@ -797,7 +969,7 @@ mod tests {
         let (sql, values, _) = query.clauses(&schema).unwrap();
         assert_eq!(
             sql,
-            " WHERE (COALESCE(`number` <> ?, TRUE) AND COALESCE(`text` <> ?, TRUE)) ORDER BY `number` ASC LIMIT ? OFFSET ?"
+            " WHERE (COALESCE(`number` <> ?, TRUE) AND COALESCE(`text` <> ?, TRUE)) ORDER BY `number` ASC"
         );
         assert_eq!(values, ["2", "2"]);
     }
@@ -822,13 +994,13 @@ mod tests {
         let (sql, values, offset) = query.clauses(&schema).unwrap();
         assert_eq!(
             sql,
-            " WHERE CAST(`text``value` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' AND HEX(`bytes`) LIKE ? ESCAPE '=' ORDER BY `text``value` DESC, `id` ASC LIMIT ? OFFSET ?"
+            " WHERE CAST(`text``value` AS CHAR CHARACTER SET utf8mb4) LIKE ? ESCAPE '=' AND HEX(`bytes`) LIKE ? ESCAPE '=' ORDER BY `text``value` DESC, `id` ASC"
         );
         assert_eq!(values, ["%a=%=_==' OR 1==1 --%", "%00FF%"]);
         assert_eq!(offset, 2000);
         assert_eq!(
             TableQuery::default().clauses(&schema).unwrap().0,
-            " ORDER BY `id` ASC LIMIT ? OFFSET ?"
+            " ORDER BY `id` ASC"
         );
         let no_key = TableSchema {
             primary_key: vec![],
@@ -836,7 +1008,7 @@ mod tests {
         };
         assert_eq!(
             TableQuery::default().clauses(&no_key).unwrap().0,
-            " ORDER BY `id` ASC, `text``value` ASC, `bytes` ASC LIMIT ? OFFSET ?"
+            " ORDER BY `id` ASC, `text``value` ASC, `bytes` ASC"
         );
         assert!(
             TableQuery {
@@ -908,6 +1080,56 @@ mod tests {
             assert_eq!(first.rows[0][0].as_deref(), Some("1"));
             assert_eq!(first.rows[999][0].as_deref(), Some("1000"));
             assert_eq!(first.keys[999], [Some("1000".into())]);
+            let export_path = std::env::temp_dir().join(format!(
+                "tablelane-filter-export-{}.json",
+                std::process::id()
+            ));
+            let export_query = TableQuery {
+                page: 2,
+                filters: vec![contains("category", "1")],
+                sort: Some(("id".into(), true)),
+            };
+            assert_eq!(
+                session
+                    .export_table(
+                        "browse_test",
+                        "widgets",
+                        &export_query,
+                        &export_path,
+                        ExportFormat::Json
+                    )
+                    .await
+                    .unwrap(),
+                1003
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
+            assert_eq!(json["rows"][0][0], "2005");
+            assert_eq!(json["rows"][1002][0], "1");
+            assert_eq!(json["rows"][0][2], format!("{}tail2005", "x".repeat(250)));
+            assert_eq!(json["rows"][0][3], "00FF");
+            let invalid = TableQuery {
+                sort: Some(("missing".into(), false)),
+                ..TableQuery::default()
+            };
+            assert!(
+                session
+                    .export_table(
+                        "browse_test",
+                        "widgets",
+                        &invalid,
+                        &export_path,
+                        ExportFormat::Json
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&export_path).unwrap())
+                    .unwrap(),
+                json
+            );
+            std::fs::remove_file(export_path).unwrap();
             query.page = 1;
             let second = session
                 .read_table("browse_test", "widgets", &query)
@@ -1034,7 +1256,10 @@ mod tests {
         });
     }
     use super::connection_url;
-    use crate::settings::{Connection, DatabaseKind};
+    use crate::{
+        data_export::ExportFormat,
+        settings::{Connection, DatabaseKind},
+    };
 
     #[test]
     #[ignore = "requires a temporary MariaDB server and TABLELANE_TEST_MARIADB_PORT"]

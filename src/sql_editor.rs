@@ -1,4 +1,9 @@
-use crate::{connections::OpenTable, database::TableRows};
+use crate::{
+    connections::OpenTable,
+    data_export::{ExportFormat, QueryExport},
+    database::TableRows,
+    workspace_state::SqlDraft,
+};
 mod history;
 use gpui_kit::{
     component::{
@@ -104,6 +109,14 @@ impl CompletionProvider for SqlCompletions {
 
 actions!(sql_editor, [RunSql, ToggleSqlComment]);
 
+fn selected_sql(sql: &str, selection: std::ops::Range<usize>) -> &str {
+    if selection.is_empty() {
+        sql
+    } else {
+        &sql[selection]
+    }
+}
+
 fn sql_comment_edit(
     sql: &str,
     mut selection: std::ops::Range<usize>,
@@ -187,17 +200,39 @@ impl TableDelegate for Results {
     }
 }
 
+pub(crate) struct DraftChanged;
+
+impl EventEmitter<DraftChanged> for SqlEditor {}
+
 pub(crate) struct SqlEditor {
-    request: OpenTable,
+    request: Option<OpenTable>,
+    draft: SqlDraft,
     input: Entity<EditorState>,
     results: Option<Entity<TableState<Results>>>,
     running: bool,
     status: String,
     failed: bool,
+    export: Option<std::sync::Arc<QueryExport>>,
+    exporting: bool,
+    export_status: Option<String>,
+    export_failed: bool,
 }
 
 impl SqlEditor {
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::from_draft(SqlDraft::new(&request), Some(request), window, cx)
+    }
+
+    pub(crate) fn restore(draft: SqlDraft, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::from_draft(draft, None, window, cx)
+    }
+
+    fn from_draft(
+        mut draft: SqlDraft,
+        request: Option<OpenTable>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         if cx.try_global::<History>().is_none() {
             cx.set_global(History::load());
         }
@@ -212,24 +247,36 @@ impl SqlEditor {
                 .placeholder("Enter one SQL statement");
             input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
                 tables: request
-                    .session
-                    .databases
-                    .get(&request.database)
+                    .as_ref()
+                    .and_then(|request| request.session.databases.get(&request.database))
                     .cloned()
                     .unwrap_or_default(),
             }));
             input
         });
-        input.update(cx, |input, cx| input.focus(window, cx));
-        cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify())
-            .detach();
+        input.update(cx, |input, cx| {
+            input.set_value(std::mem::take(&mut draft.sql), window, cx);
+            input.focus(window, cx);
+        });
+        cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.emit(DraftChanged);
+            }
+            cx.notify();
+        })
+        .detach();
         Self {
             request,
+            draft,
             input,
             results: None,
             running: false,
             status: "Run a statement to see its results".into(),
             failed: false,
+            export: None,
+            exporting: false,
+            export_status: None,
+            export_failed: false,
         }
     }
 
@@ -240,6 +287,7 @@ impl SqlEditor {
     pub(crate) fn set_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
         self.input
             .update(cx, |input, cx| input.set_value(sql, window, cx));
+        cx.emit(DraftChanged);
         cx.notify();
     }
 
@@ -247,8 +295,59 @@ impl SqlEditor {
         self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
 
-    pub(crate) fn request(&self) -> &OpenTable {
-        &self.request
+    pub(crate) fn request(&self) -> Option<&OpenTable> {
+        self.request.as_ref()
+    }
+
+    pub(crate) fn draft(&self, cx: &App) -> SqlDraft {
+        SqlDraft {
+            sql: self.input.read(cx).value().to_string(),
+            ..self.draft.clone()
+        }
+    }
+
+    pub(crate) fn connection_name(&self) -> &str {
+        &self.draft.connection_name
+    }
+
+    pub(crate) fn database(&self) -> &str {
+        &self.draft.database
+    }
+
+    pub(crate) fn connection_key(&self) -> &str {
+        &self.draft.connection_key
+    }
+
+    pub(crate) fn attach(
+        &mut self,
+        session: std::sync::Arc<crate::database::Session>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.request.is_some()
+            || session.connection_key() != self.draft.connection_key
+            || !session.databases.contains_key(&self.draft.database)
+        {
+            return;
+        }
+        self.input.update(cx, |input, _| {
+            input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
+                tables: session
+                    .databases
+                    .get(&self.draft.database)
+                    .cloned()
+                    .unwrap_or_default(),
+            }));
+        });
+        self.draft.connection_name = name.clone();
+        self.request = Some(OpenTable {
+            session,
+            connection_name: name,
+            database: self.draft.database.clone(),
+            table: self.draft.table.clone(),
+        });
+        cx.emit(DraftChanged);
+        cx.notify();
     }
 
     pub(crate) fn has_draft(&self, cx: &App) -> bool {
@@ -268,20 +367,26 @@ impl SqlEditor {
     }
 
     fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sql = self.input.read(cx).value().to_string();
-        if self.running || sql.trim().is_empty() {
+        let input = self.input.read(cx);
+        let text = input.value();
+        let sql = selected_sql(&text, input.selected_range()).to_owned();
+        if self.running || self.exporting || self.request.is_none() || sql.trim().is_empty() {
             return;
         }
         self.running = true;
         self.failed = false;
         self.status = "Running SQL…".into();
         self.results = None;
-        let request = self.request.clone();
+        self.export = None;
+        self.export_status = None;
+        let Some(request) = self.request.clone() else {
+            return;
+        };
         let history_sql = sql.clone();
         let task = cx.background_spawn(async move {
             let start = std::time::Instant::now();
             let result =
-                async_std::task::block_on(request.session.run_sql(&request.database, &sql));
+                async_std::task::block_on(request.session.run_sql_export(&request.database, &sql));
             (result, start.elapsed())
         });
         cx.spawn_in(window, async move |editor, cx| {
@@ -289,10 +394,10 @@ impl SqlEditor {
             let _ = editor.update_in(cx, |editor, window, cx| {
                 editor.running = false;
                 match result {
-                    Ok((data, affected)) => {
+                    Ok((data, affected, export)) => {
                         editor.status = format!(
                             "{} rows{} · {affected} rows affected · {:.2} s",
-                            data.rows.len(),
+                            export.row_count(),
                             if data.has_more {
                                 " (first 1,000 shown)"
                             } else {
@@ -301,6 +406,7 @@ impl SqlEditor {
                             elapsed.as_secs_f64()
                         );
                         if !data.schema.columns.is_empty() {
+                            editor.export = Some(std::sync::Arc::new(export));
                             let columns = data
                                 .schema
                                 .columns
@@ -326,8 +432,8 @@ impl SqlEditor {
                     }
                 }
                 cx.global_mut::<History>().record(
-                    editor.request.connection_name.clone(),
-                    editor.request.database.clone(),
+                    editor.draft.connection_name.clone(),
+                    editor.draft.database.clone(),
                     history_sql,
                     editor.status.clone(),
                     editor.failed,
@@ -339,13 +445,63 @@ impl SqlEditor {
         cx.notify();
     }
 
+    fn export_results(
+        &mut self,
+        format: ExportFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running || self.exporting {
+            return;
+        }
+        let Some(export) = self.export.clone() else {
+            return;
+        };
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| ".".into());
+        let name = format!("query-results.{}", format.extension());
+        let picker = cx.prompt_for_new_path(&directory, Some(&name));
+        self.exporting = true;
+        self.export_failed = false;
+        self.export_status = Some("Choose an export file…".into());
+        cx.notify();
+        cx.spawn_in(window, async move |editor, cx| {
+            let result: anyhow::Result<Option<usize>> = async {
+                let Some(path) = picker.await?? else {
+                    return Ok(None);
+                };
+                let _ = editor.update_in(cx, |editor, _, cx| {
+                    editor.export_status = Some("Exporting results…".into());
+                    cx.notify();
+                });
+                cx.background_spawn(async move { export.export(&path, format).map(Some) })
+                    .await
+            }
+            .await;
+            let _ = editor.update_in(cx, |editor, _, cx| {
+                editor.exporting = false;
+                editor.export_status = match result {
+                    Ok(Some(rows)) => Some(format!("Exported {rows} rows.")),
+                    Ok(None) => None,
+                    Err(error) => {
+                        editor.export_failed = true;
+                        Some(format!("Couldn’t export results: {error}."))
+                    }
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running || window.has_active_dialog(cx) {
             return;
         }
         let history = cx.global::<History>();
         let entries: Vec<_> = history
-            .entries(&self.request.connection_name, &self.request.database)
+            .entries(&self.draft.connection_name, &self.draft.database)
             .cloned()
             .collect();
         let error = history.error.clone();
@@ -373,7 +529,7 @@ impl SqlEditor {
         .detach();
         let title = format!(
             "SQL history · {} / {}",
-            self.request.connection_name, self.request.database
+            self.draft.connection_name, self.draft.database
         );
         let history_list = list.clone();
         window.open_dialog(cx, move |dialog, window, cx| {
@@ -498,7 +654,7 @@ impl Render for SqlEditor {
                 div()
                     .id("sql-database")
                     .test_support()
-                    .aria_label(format!("Selected database: {}", self.request.database))
+                    .aria_label(format!("Selected database: {}", self.draft.database))
                     .px_3()
                     .py_2()
                     .flex_shrink_0()
@@ -512,8 +668,13 @@ impl Render for SqlEditor {
                             .small()
                             .flex_shrink_0(),
                     )
-                    .child(div().truncate().child(self.request.database.clone())),
+                    .child(div().truncate().child(self.draft.database.clone())),
             )
+            .when(self.request.is_none(), |view| view.child(
+                div().id("sql-offline").test_support().role(Role::Status)
+                    .aria_label("Draft restored offline. Connect its saved connection in the sidebar to run SQL.")
+                    .px_3().pb_2().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("Draft restored offline. Connect its saved connection in the sidebar to run SQL.")))
             .child(
                 div().id("sql-input").p_3().flex_shrink_0().child(
                     Editor::new(&self.input)
@@ -527,6 +688,7 @@ impl Render for SqlEditor {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .flex_wrap()
                     .px_3()
                     .pb_2()
                     .flex_shrink_0()
@@ -534,9 +696,9 @@ impl Render for SqlEditor {
                         Button::new("run-sql")
                             .small()
                             .label("Run")
-                            .tooltip("Run SQL (Cmd/Ctrl+Enter)")
+                            .tooltip("Run selected SQL, or the whole statement (Cmd/Ctrl+Enter)")
                             .loading(self.running)
-                            .disabled(self.running || self.input.read(cx).value().trim().is_empty())
+                            .disabled(self.running || self.exporting || self.request.is_none() || self.input.read(cx).value().trim().is_empty())
                             .on_click(cx.listener(|editor, _, window, cx| editor.run(window, cx))),
                     )
                     .child(
@@ -550,6 +712,20 @@ impl Render for SqlEditor {
                                     editor.open_history(window, cx)
                                 }),
                             ),
+                    )
+                    .child(
+                        Button::new("export-sql-csv")
+                            .small().ghost().label("Export CSV…")
+                            .disabled(self.running || self.exporting || self.export.is_none())
+                            .tooltip("Export the completed result with full values, including rows beyond the preview")
+                            .on_click(cx.listener(|editor, _, window, cx| editor.export_results(ExportFormat::Csv, window, cx))),
+                    )
+                    .child(
+                        Button::new("export-sql-json")
+                            .small().ghost().label("Export JSON…")
+                            .disabled(self.running || self.exporting || self.export.is_none())
+                            .tooltip("Export the completed result with full values, including rows beyond the preview")
+                            .on_click(cx.listener(|editor, _, window, cx| editor.export_results(ExportFormat::Json, window, cx))),
                     )
                     .child(
                         div()
@@ -606,6 +782,12 @@ impl Render for SqlEditor {
                         )
                     }),
             )
+            .when_some(self.export_status.as_ref(), |view, status| {
+                view.child(div().id("sql-export-status").test_support().role(Role::Status)
+                    .aria_label(status.clone()).px_3().pb_2().text_sm()
+                    .text_color(if self.export_failed { cx.theme().danger } else { cx.theme().muted_foreground })
+                    .child(status.clone()))
+            })
             .when_some(self.results.as_ref(), |view, results| {
                 view.child(
                     div()
@@ -631,6 +813,387 @@ mod tests {
         px, size,
         test::{TestAppContextExt, TestWindowExt},
     };
+
+    #[test]
+    fn sql_execution_uses_selection_or_whole_statement() {
+        let sql = "SELECT '世界'; SELECT 2";
+        assert_eq!(super::selected_sql(sql, 0..0), sql);
+        let start = sql.find("SELECT 2").unwrap();
+        assert_eq!(super::selected_sql(sql, start..sql.len()), "SELECT 2");
+        assert_eq!(super::selected_sql(sql, 7..15), "'世界'");
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_restored_drafts_attach_only_to_their_connection_without_execution(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::workspace_state::{SqlDraft, WorkspaceFile, WorkspaceState};
+        let directory =
+            std::env::temp_dir().join(format!("tablelane-workspace-live-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let config = Connection {
+            name: "Renamed".into(),
+            database_type: DatabaseKind::MariaDB,
+            host: "127.0.0.1".into(),
+            port: Some(
+                std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ),
+            username: "root".into(),
+            password: String::new(),
+            database: String::new(),
+            file_path: String::new(),
+        };
+        let mut wrong = config.clone();
+        wrong.username = "another-user".into();
+        let mut state = WorkspaceState::default();
+        state.tabs = vec![
+            SqlDraft {
+                number: 1,
+                connection_key: config.key(),
+                connection_name: "Old name".into(),
+                database: "tablelane_test".into(),
+                table: "widgets".into(),
+                sql: "SELECT @recovery_runs := COALESCE(@recovery_runs, 0) + 1".into(),
+            },
+            SqlDraft {
+                number: 2,
+                connection_key: config.key(),
+                connection_name: "Old name".into(),
+                database: "missing_database".into(),
+                table: String::new(),
+                sql: "SELECT 2".into(),
+            },
+            SqlDraft {
+                number: 3,
+                connection_key: wrong.key(),
+                connection_name: "Old name".into(),
+                database: "tablelane_test".into(),
+                table: "widgets".into(),
+                sql: "SELECT 3".into(),
+            },
+        ];
+        assert!(
+            WorkspaceFile::load(Some(directory.join("workspace.json")))
+                .0
+                .save(&state)
+        );
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(super::History::for_test());
+            cx.set_global(crate::settings::Settings {
+                connections: vec![config.clone()],
+                ..crate::settings::Settings::default()
+            });
+        });
+        let mut app = None;
+        let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                crate::AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let editors = cx.update(|cx| {
+            app.read(cx)
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let crate::WorkspaceTab::Sql(editor, _) = tab else {
+                        panic!("SQL tab missing")
+                    };
+                    editor.clone()
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                editors
+                    .iter()
+                    .all(|editor| editor.read(cx).request().is_none())
+            );
+            window.click("run-sql", cx);
+            assert!(!editors[0].read(cx).is_running());
+            window.double_click("connection-1", cx);
+        })
+        .unwrap();
+        let timeout = std::time::Duration::from_secs(15);
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            editors[0].read(cx).request().is_some()
+        })
+        .await;
+        let session = cx.update(|cx| {
+            assert_eq!(editors[0].read(cx).connection_name(), "Renamed");
+            assert!(!editors[0].read(cx).is_running());
+            assert!(editors[0].read(cx).results.is_none());
+            assert_eq!(editors[0].read(cx).draft(cx).sql, state.tabs[0].sql);
+            assert!(editors[1].read(cx).request().is_none());
+            assert!(editors[2].read(cx).request().is_none());
+            editors[0].read(cx).request().unwrap().session.clone()
+        });
+        let (result, _) =
+            async_std::task::block_on(session.run_sql("tablelane_test", "SELECT @recovery_runs"))
+                .unwrap();
+        assert_eq!(result.rows[0][0], None);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("sql-offline").is_none());
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !editors[0].read(cx).is_running()
+        })
+        .await;
+        cx.update(|cx| {
+            assert!(!editors[0].read(cx).failed);
+            assert_eq!(
+                editors[0]
+                    .read(cx)
+                    .results
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+        });
+        let (result, _) =
+            async_std::task::block_on(session.run_sql("tablelane_test", "SELECT @recovery_runs"))
+                .unwrap();
+        assert_eq!(result.rows[0][0].as_deref(), Some("1"));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("toolbar-sql-editor", cx);
+            window.input("SELECT 'new draft 保存'", cx);
+            app.update(cx, |view, cx| {
+                assert!(view.save_workspace(cx));
+            });
+            window.within("workspace-tabs").click(1_usize, cx);
+            assert!(window.find("sql-offline").visible());
+            window.click("run-sql", cx);
+            assert!(!editors[1].read(cx).is_running());
+        })
+        .unwrap();
+        let saved = WorkspaceFile::load(Some(directory.join("workspace.json"))).1;
+        assert_eq!(saved.tabs.len(), 4);
+        assert_eq!(saved.tabs[3].number, 4);
+        assert_eq!(saved.tabs[3].sql, "SELECT 'new draft 保存'");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_exports_tables_and_completed_sql_without_repeating_statements(
+        cx: &mut TestAppContext,
+    ) {
+        let session = std::sync::Arc::new(
+            async_std::task::block_on(crate::database::connect(&Connection {
+                name: "Export test".into(),
+                database_type: DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(
+                    std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                ),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            }))
+            .unwrap(),
+        );
+        async_std::task::block_on(async {
+            session
+                .run_sql("mysql", "CREATE DATABASE export_test")
+                .await
+                .unwrap();
+            session.run_sql("export_test", "CREATE TABLE widgets (id INT PRIMARY KEY, body LONGTEXT, bytes BLOB, nullable TEXT, empty TEXT)").await.unwrap();
+            session.run_sql("export_test", "INSERT INTO widgets SELECT seq, REPEAT('世界', 300), REPEAT(X'00FF', 150), NULL, '' FROM seq_1_to_1005").await.unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("tablelane-export-ui-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_global(super::History::for_test()));
+        let request = OpenTable {
+            session: session.clone(),
+            connection_name: "Export test".into(),
+            database: "export_test".into(),
+            table: "widgets".into(),
+        };
+        let mut editor = None;
+        let handle = cx.open_window(size(px(1100.), px(650.)), |window, cx| {
+            let view = cx.new(|cx| SqlEditor::new(request.clone(), window, cx));
+            editor = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let timeout = std::time::Duration::from_secs(15);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("export-sql-json", cx);
+            assert!(!editor.read(cx).exporting);
+            window.input("SELECT id AS duplicate, id AS duplicate, body, bytes, nullable, empty, @export_runs := COALESCE(@export_runs, 0) + 1 AS invocation FROM widgets ORDER BY id", cx);
+            window.click("run-sql", cx);
+            window.click("export-sql-json", cx);
+            assert!(!editor.read(cx).exporting);
+        }).unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).running)
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = editor.read(cx);
+            assert!(!view.failed, "{}", view.status);
+            assert_eq!(view.export.as_ref().unwrap().row_count(), 1005);
+            assert_eq!(
+                view.results
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows
+                    .len(),
+                1000
+            );
+            assert!(view.status.contains("1005 rows (first 1,000 shown)"));
+            window.click("export-sql-json", cx);
+            window.click("export-sql-csv", cx);
+            assert!(editor.read(cx).exporting);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| None);
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).exporting)
+            .await;
+        cx.update(|cx| assert!(editor.read(cx).export_status.is_none()));
+        let json_path = directory.join("query.json");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("export-sql-json", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(json_path.clone()));
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).exporting)
+            .await;
+        cx.update(|cx| assert!(!editor.read(cx).export_failed));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(json["columns"][0], json["columns"][1]);
+        assert_eq!(json["rows"].as_array().unwrap().len(), 1005);
+        assert_eq!(json["rows"][1004][2], "世界".repeat(300));
+        assert_eq!(json["rows"][1004][3], "00FF".repeat(150));
+        assert!(json["rows"][1004][4].is_null());
+        assert_eq!(json["rows"][1004][5], "");
+        assert_eq!(json["rows"][1004][6], "1005");
+        let csv_path = directory.join("query.csv");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("export-sql-csv", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(csv_path.clone()));
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).exporting)
+            .await;
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        assert_eq!(csv.lines().count(), 1006);
+        assert!(csv.contains(&format!("\"{}\"", "00FF".repeat(150))));
+        let (count, _) =
+            async_std::task::block_on(session.run_sql("export_test", "SELECT @export_runs"))
+                .unwrap();
+        assert_eq!(count.rows[0][0].as_deref(), Some("1005"));
+        // An unwritable destination keeps the result available for another export attempt.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("export-sql-json", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(directory.clone()));
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).exporting)
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(editor.read(cx).export_failed);
+            assert!(editor.read(cx).export.is_some());
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("sql-export-status")
+                    .label()
+                    .unwrap()
+                    .contains("Couldn’t export")
+            );
+        })
+        .unwrap();
+
+        let mut table = None;
+        let table_handle = cx.open_window(size(px(1100.), px(650.)), |window, cx| {
+            let view = cx.new(|cx| crate::table_view::TableView::new(request, window, cx));
+            table = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let table = table.unwrap();
+        cx.wait_for(table_handle.into(), timeout, |window, _| {
+            window.try_find("export-table-json").is_some()
+        })
+        .await;
+        cx.update_window(table_handle.into(), |_, window, cx| {
+            window.click("export-table-json", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let table_path = directory.join("table.json");
+        cx.simulate_new_path_selection(|_| Some(table_path.clone()));
+        cx.wait_for(table_handle.into(), timeout, |window, _| {
+            window
+                .try_find("table-export-status")
+                .and_then(|status| status.label().map(str::to_owned))
+                .is_some_and(|label| label.contains("Exported 1005 matching rows"))
+        })
+        .await;
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&table_path).unwrap()).unwrap();
+        assert_eq!(json["rows"][1004][0], "1005");
+        assert_eq!(json["rows"][1004][1], "世界".repeat(300));
+        assert_eq!(json["rows"][1004][2], "00FF".repeat(150));
+        assert!(json["rows"][1004][3].is_null());
+        assert_eq!(json["rows"][1004][4], "");
+        cx.update_window(table_handle.into(), |_, window, cx| {
+            window.click("export-table-csv", cx);
+            assert!(!table.read(cx).can_change_schema(cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let table_csv = directory.join("table.csv");
+        cx.simulate_new_path_selection(|_| Some(table_csv.clone()));
+        cx.wait_for(table_handle.into(), timeout, |window, _| {
+            window
+                .try_find("table-export-status")
+                .and_then(|status| status.label().map(str::to_owned))
+                .is_some_and(|label| label.contains("Exported 1005 matching rows"))
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(table_csv).unwrap().lines().count(),
+            1006
+        );
+        async_std::task::block_on(session.run_sql("mysql", "DROP DATABASE export_test")).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn sql_completions_match_prefixes_and_replace_complete_identifiers() {
@@ -997,7 +1560,13 @@ mod tests {
             );
             window.click(("input", editor.read(cx).input.entity_id()), cx);
             window.press("secondary-a", cx);
-            window.input("UPDATE widgets SET name = 'updated' WHERE id = 1", cx);
+            let statement = "UPDATE widgets SET name = 'updated' WHERE id = 1";
+            let draft = format!("THIS IS NOT SQL;\n{statement}");
+            window.input(&draft, cx);
+            let input = editor.read(cx).input.clone();
+            input.update(cx, |input, cx| {
+                input.set_selected_range(draft.len() - statement.len()..draft.len(), cx);
+            });
             window.press("cmd-enter", cx);
             assert!(editor.read(cx).running);
         })

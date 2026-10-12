@@ -120,6 +120,23 @@ impl Connections {
         cx.notify();
     }
 
+    pub(crate) fn selected_connection(&self, cx: &App) -> Option<usize> {
+        let id = &self.tree.read(cx).selected_item()?.id;
+        self.entries.iter().position(|entry| {
+            *id == entry.item.id || id.starts_with(&format!("{}/database/", entry.item.id))
+        })
+    }
+
+    pub(crate) fn session_for(
+        &self,
+        key: &str,
+    ) -> Option<(std::sync::Arc<database::Session>, String)> {
+        self.entries.iter().find_map(|entry| {
+            let session = entry.session.as_ref()?;
+            (session.connection_key() == key).then(|| (session.clone(), entry.config.name.clone()))
+        })
+    }
+
     fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
         for entry in &self.entries {
             for database in &entry.item.children {

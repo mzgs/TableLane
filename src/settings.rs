@@ -60,6 +60,18 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    pub(crate) fn key(&self) -> String {
+        serde_json::to_string(&(
+            self.database_type,
+            &self.host,
+            self.port,
+            &self.username,
+            &self.database,
+            &self.file_path,
+        ))
+        .expect("connection identity contains only serializable fields")
+    }
+
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.name.trim().is_empty() {
             return Err("Enter a connection name.");

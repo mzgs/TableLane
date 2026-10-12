@@ -1,5 +1,6 @@
 use crate::{
     connections::OpenTable,
+    data_export::ExportFormat,
     database::{
         FilterOperator, PAGE_SIZE, TableFilter, TableQuery, TableRows, TableSchema,
         truncate_preview,
@@ -9,6 +10,7 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Sizable,
         button::{Button, ButtonVariants},
+        checkbox::Checkbox,
         form::{Field, Form},
         input::{Input, InputEvent, InputState, Textarea, TextareaState},
         scroll::ScrollableElement,
@@ -206,13 +208,16 @@ pub(crate) struct TableView {
     filter_value: Option<Entity<InputState>>,
     filter_task: Option<Task<()>>,
     filter_pending: bool,
+    exporting: bool,
+    export_status: Option<String>,
+    export_failed: bool,
 }
 
 impl EventEmitter<TableEvent> for TableView {}
 
 impl TableView {
     pub(crate) fn can_change_schema(&self, cx: &App) -> bool {
-        !self.is_dirty(cx) && !self.saving && !self.loading && !self.loading_row
+        !self.is_dirty(cx) && !self.saving && !self.loading && !self.loading_row && !self.exporting
     }
 
     pub(crate) fn begin_schema_change(&mut self, cx: &mut Context<Self>) {
@@ -558,6 +563,69 @@ impl TableView {
         cx.notify();
     }
 
+    fn export_rows(&mut self, format: ExportFormat, window: &mut Window, cx: &mut Context<Self>) {
+        if self.exporting
+            || self.loading
+            || self.saving
+            || self.loading_row
+            || self.filter_pending
+            || self.is_dirty(cx)
+        {
+            return;
+        }
+        let Some(request) = self.request.clone() else {
+            return;
+        };
+        let query = self.query.clone();
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| ".".into());
+        let picker = cx.prompt_for_new_path(
+            &directory,
+            Some(&format!("table-results.{}", format.extension())),
+        );
+        self.exporting = true;
+        self.export_failed = false;
+        self.export_status = Some("Choose an export file…".into());
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            let result: anyhow::Result<Option<usize>> = async {
+                let Some(path) = picker.await?? else {
+                    return Ok(None);
+                };
+                let _ = view.update_in(cx, |view, _, cx| {
+                    view.export_status = Some("Exporting all matching rows…".into());
+                    cx.notify();
+                });
+                cx.background_spawn(async move {
+                    async_std::task::block_on(request.session.export_table(
+                        &request.database,
+                        &request.table,
+                        &query,
+                        &path,
+                        format,
+                    ))
+                    .map(Some)
+                })
+                .await
+            }
+            .await;
+            let _ = view.update_in(cx, |view, _, cx| {
+                view.exporting = false;
+                view.export_status = match result {
+                    Ok(Some(rows)) => Some(format!("Exported {rows} matching rows.")),
+                    Ok(None) => None,
+                    Err(error) => {
+                        view.export_failed = true;
+                        Some(format!("Couldn’t export table: {error}."))
+                    }
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn select_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(table) = &self.table else {
             return;
@@ -753,7 +821,7 @@ impl TableView {
         .detach();
     }
 
-    pub(crate) fn render_sidebar(&self, cx: &App) -> Div {
+    pub(crate) fn render_sidebar(&self, cx: &Context<Self>) -> Div {
         let dirty = self.is_dirty(cx);
         div()
             .flex()
@@ -811,12 +879,36 @@ impl TableView {
             })
             .child(
                 Form::new()
-                    .children(self.fields.iter().map(|field| {
+                    .children(self.fields.iter().enumerate().map(|(ix, field)| {
                         Field::new()
                             .label(field.name.clone())
                             .when(!field.editable, |field| {
                                 field.description("Cannot be edited")
                             })
+                            .child(
+                                Checkbox::new(SharedString::from(format!(
+                                    "row-null-{}",
+                                    field.name
+                                )))
+                                .label("Use NULL")
+                                .accessibility_label(format!("Use NULL for {}", field.name))
+                                .checked(field.is_null)
+                                .disabled(self.saving || !field.editable)
+                                .on_click(cx.listener(
+                                    move |view, checked, _, cx| {
+                                        if view.saving {
+                                            return;
+                                        }
+                                        if let Some(field) = view.fields.get_mut(ix)
+                                            && field.editable
+                                        {
+                                            field.is_null = *checked;
+                                            view.edit_error = None;
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            )
                             .child(
                                 Textarea::new(&field.input)
                                     .accessibility_id(SharedString::from(format!(
@@ -824,7 +916,7 @@ impl TableView {
                                         field.name
                                     )))
                                     .aria_label(field.name.clone())
-                                    .disabled(self.saving || !field.editable)
+                                    .disabled(self.saving || !field.editable || field.is_null)
                                     .small(),
                             )
                     }))
@@ -1037,6 +1129,12 @@ impl Render for TableView {
                         .child(status),
                 )
             })
+            .when_some(self.export_status.as_ref(), |view, status| {
+                view.child(div().id("table-export-status").test_support().role(Role::Status)
+                    .aria_label(status.clone()).px_3().py_2().text_sm()
+                    .text_color(if self.export_failed { cx.theme().danger } else { cx.theme().muted_foreground })
+                    .child(status.clone()))
+            })
             .when_some(self.table.as_ref(), |view, table| {
                 view.child(
                     div()
@@ -1101,6 +1199,20 @@ impl Render for TableView {
                                     query.page += 1;
                                     view.load(query, window, cx);
                                 })),
+                        )
+                        .child(
+                            Button::new("export-table-csv")
+                                .small().ghost().label("Export CSV…")
+                                .disabled(busy || self.exporting || self.loading_row || self.filter_pending || self.request.is_none())
+                                .tooltip("Export all matching rows with full values, using the applied filters and sort order")
+                                .on_click(cx.listener(|view, _, window, cx| view.export_rows(ExportFormat::Csv, window, cx))),
+                        )
+                        .child(
+                            Button::new("export-table-json")
+                                .small().ghost().label("Export JSON…")
+                                .disabled(busy || self.exporting || self.loading_row || self.filter_pending || self.request.is_none())
+                                .tooltip("Export all matching rows with full values, using the applied filters and sort order")
+                                .on_click(cx.listener(|view, _, window, cx| view.export_rows(ExportFormat::Json, window, cx))),
                         )
                         .child(
                             Button::new("refresh-table")
@@ -1488,6 +1600,7 @@ mod tests {
                     .rows[0][1],
                 Some("Updated".into())
             );
+            window.click("row-null-nullable", cx);
             window.click(field_id(&view, "nullable", cx), cx);
             window.input("Discard", cx);
         })
@@ -1507,6 +1620,32 @@ mod tests {
             );
             assert!(view.read(cx).fields[3].is_null);
             assert!(window.try_find("row-edit-status").is_none());
+            window.click("row-null-nullable", cx);
+            window.click("save-row", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !view.read(cx).saving)
+            .await;
+        let nullable: Option<String> = async_std::task::block_on(
+            sqlx::query_scalar("SELECT nullable FROM sidebar_edit_test.widgets WHERE id = 1")
+                .fetch_one(&mut database),
+        )
+        .unwrap();
+        assert_eq!(nullable, Some(String::new()));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("row-null-nullable", cx);
+            window.click("save-row", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !view.read(cx).saving)
+            .await;
+        let nullable: Option<String> = async_std::task::block_on(
+            sqlx::query_scalar("SELECT nullable FROM sidebar_edit_test.widgets WHERE id = 1")
+                .fetch_one(&mut database),
+        )
+        .unwrap();
+        assert_eq!(nullable, None);
+        cx.update_window(handle.into(), |_, window, cx| {
             window.click(field_id(&view, "id", cx), cx);
             window.press("secondary-a", cx);
             window.input("invalid", cx);
@@ -1958,6 +2097,15 @@ mod tests {
                     .as_ref(),
                 ""
             );
+            window.click("row-null-name", cx);
+            assert_eq!(view.read(cx).fields[1].value(cx), None);
+            assert!(view.read(cx).is_dirty(cx));
+            window.click(field_id(&view, "name", cx), cx);
+            window.input("blocked", cx);
+            assert_eq!(view.read(cx).fields[1].input.read(cx).value().as_ref(), "");
+            window.click("row-null-name", cx);
+            assert_eq!(view.read(cx).fields[1].value(cx), Some(String::new()));
+            assert!(!view.read(cx).is_dirty(cx));
             window.click("toggle-right-sidebar", cx);
             assert!(window.try_find("right-sidebar").is_none());
             window.click_at(
