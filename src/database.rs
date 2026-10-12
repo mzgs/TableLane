@@ -199,6 +199,33 @@ pub(crate) struct TableRows {
     pub(crate) has_more: bool,
 }
 
+#[non_exhaustive]
+pub(crate) struct TableStructure {
+    pub(crate) columns: TableRows,
+    pub(crate) indexes: TableRows,
+    pub(crate) foreign_keys: TableRows,
+    pub(crate) ddl: String,
+    pub(crate) no_backslash_escapes: bool,
+}
+
+fn metadata_rows(
+    records: Vec<sqlx::mysql::MySqlRow>,
+    names: &[&str],
+) -> Result<TableRows, sqlx::Error> {
+    Ok(TableRows {
+        schema: TableSchema {
+            columns: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..TableSchema::default()
+        },
+        rows: records
+            .iter()
+            .map(|row| (0..names.len()).map(|ix| row.try_get(ix)).collect())
+            .collect::<Result<_, _>>()?,
+        keys: Vec::new(),
+        has_more: false,
+    })
+}
+
 impl TableSchema {
     fn kind(&self, ix: usize) -> &str {
         self.column_types[ix].split(['(', ' ']).next().unwrap_or("")
@@ -309,6 +336,33 @@ pub(crate) fn truncate_preview(mut value: String) -> String {
 }
 
 impl Session {
+    pub(crate) async fn read_structure(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<TableStructure, String> {
+        async_std::future::timeout(std::time::Duration::from_secs(15), async {
+            let mut connection = self.connection.lock().await;
+            let sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *connection).await?;
+            let ddl = sqlx::query(&format!("SHOW CREATE TABLE {}.{}", quote_identifier(database), quote_identifier(table)))
+                .fetch_one(&mut *connection).await?.try_get(1)?;
+            let columns = sqlx::query("SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA, COLLATION_NAME, COLUMN_COMMENT, GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")
+                .bind(database).bind(table).fetch_all(&mut *connection).await?;
+            let indexes = sqlx::query("SELECT INDEX_NAME, IF(NON_UNIQUE = 0, 'Yes', 'No'), CAST(SEQ_IN_INDEX AS CHAR), COLUMN_NAME, CAST(SUB_PART AS CHAR), INDEX_TYPE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX")
+                .bind(database).bind(table).fetch_all(&mut *connection).await?;
+            let foreign_keys = sqlx::query("SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, r.UPDATE_RULE, r.DELETE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.TABLE_NAME = k.TABLE_NAME AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION")
+                .bind(database).bind(table).fetch_all(&mut *connection).await?;
+            Ok::<_, sqlx::Error>(TableStructure {
+                columns: metadata_rows(columns, &["Column", "Type", "Nullable", "Default", "Key", "Extra", "Collation", "Comment", "Expression"] )?,
+                indexes: metadata_rows(indexes, &["Index", "Unique", "Position", "Column", "Prefix length", "Type"] )?,
+                foreign_keys: metadata_rows(foreign_keys, &["Constraint", "Column", "Database", "Table", "Referenced column", "On update", "On delete"] )?,
+                ddl,
+                no_backslash_escapes: sql_mode.split(',').any(|mode| mode == "NO_BACKSLASH_ESCAPES"),
+            })
+        }).await.map_err(|_| "Loading table structure timed out. Try Refresh.".to_owned())?
+            .map_err(|error| format!("Couldn’t load table structure: {error}"))
+    }
+
     pub(crate) async fn run_sql(
         &self,
         database: &str,

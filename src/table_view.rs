@@ -211,6 +211,28 @@ pub(crate) struct TableView {
 impl EventEmitter<TableEvent> for TableView {}
 
 impl TableView {
+    pub(crate) fn can_change_schema(&self, cx: &App) -> bool {
+        !self.is_dirty(cx) && !self.saving && !self.loading && !self.loading_row
+    }
+
+    pub(crate) fn begin_schema_change(&mut self, cx: &mut Context<Self>) {
+        self.saving = true;
+        cx.notify();
+    }
+
+    pub(crate) fn finish_schema_change(
+        &mut self,
+        changed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = false;
+        if changed {
+            self.load(TableQuery::default(), window, cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         if let Some(table) = &self.table {
             table.focus_handle(cx).focus(window, cx);
@@ -1794,6 +1816,7 @@ mod tests {
             window.click(field_id(&first, "name", cx), cx);
             window.press("secondary-a", cx);
             window.input("Draft value", cx);
+            assert!(!first.read(cx).can_change_schema(cx));
             assert_eq!(
                 window.within("workspace-tabs").find(0_usize).label(),
                 Some("Local / test / widgets · Edited")

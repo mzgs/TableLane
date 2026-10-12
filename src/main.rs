@@ -1,6 +1,7 @@
 mod connection_dialog;
 mod connections;
 mod database;
+mod schema_view;
 mod settings;
 mod settings_view;
 mod sql_editor;
@@ -55,6 +56,7 @@ actions!(
 enum WorkspaceTab {
     Table(Entity<table_view::TableView>),
     Sql(Entity<sql_editor::SqlEditor>, usize),
+    Structure(Entity<schema_view::SchemaView>),
 }
 
 impl WorkspaceTab {
@@ -62,6 +64,7 @@ impl WorkspaceTab {
         match self {
             Self::Table(table) => table.entity_id(),
             Self::Sql(editor, _) => editor.entity_id(),
+            Self::Structure(view) => view.entity_id(),
         }
     }
 
@@ -69,11 +72,23 @@ impl WorkspaceTab {
         match self {
             Self::Table(table) => table.read(cx).request(),
             Self::Sql(editor, _) => Some(editor.read(cx).request()),
+            Self::Structure(view) => Some(view.read(cx).request()),
         }
     }
 
     fn label(&self, cx: &App) -> String {
         match self {
+            Self::Structure(view) => {
+                let view = view.read(cx);
+                let request = view.request();
+                format!(
+                    "{} / {} / {} · Structure{}",
+                    request.connection_name,
+                    request.database,
+                    request.table,
+                    if view.is_running() { " · Running" } else { "" }
+                )
+            }
             Self::Table(table) => format!(
                 "{}{}",
                 table.read(cx).title(),
@@ -228,6 +243,7 @@ impl AppView {
             WorkspaceTab::Sql(editor, _) => {
                 editor.update(cx, |editor, cx| editor.focus(window, cx))
             }
+            WorkspaceTab::Structure(view) => view.update(cx, |view, cx| view.focus(window, cx)),
         }
         cx.notify();
     }
@@ -270,11 +286,72 @@ impl AppView {
         else {
             return;
         };
+        self.open_sql_draft(request, None, window, cx);
+    }
+
+    fn open_sql_draft(
+        &mut self,
+        request: connections::OpenTable,
+        sql: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let editor = cx.new(|cx| sql_editor::SqlEditor::new(request, window, cx));
+        if let Some(sql) = sql {
+            editor.update(cx, |editor, cx| editor.set_sql(sql, window, cx));
+        }
         cx.observe(&editor, |_, _, cx| cx.notify()).detach();
         self.tabs
             .push(WorkspaceTab::Sql(editor, self.next_sql_number));
         self.next_sql_number += 1;
+        self.select_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    fn open_structure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(request) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.request(cx))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(ix) = self.tabs.iter().position(|tab| {
+            matches!(tab, WorkspaceTab::Structure(_))
+                && tab.request(cx).is_some_and(|open| {
+                    std::sync::Arc::ptr_eq(&open.session, &request.session)
+                        && open.database == request.database
+                        && open.table == request.table
+                })
+        }) {
+            self.select_tab(ix, window, cx);
+            return;
+        }
+        let structure = cx.new(|cx| schema_view::SchemaView::new(request, window, cx));
+        cx.observe(&structure, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(&structure, window, |view, structure, event, window, cx| {
+            let request = structure.read(cx).request().clone();
+            let tables: Vec<_> = view.tabs.iter().filter_map(|tab| match tab {
+                WorkspaceTab::Table(table) if table.read(cx).request().is_some_and(|open|
+                    std::sync::Arc::ptr_eq(&open.session, &request.session) && open.database == request.database && open.table == request.table) => Some(table.clone()),
+                _ => None,
+            }).collect();
+            match event {
+                schema_view::SchemaEvent::Apply(sql) => {
+                    if tables.iter().any(|table| !table.read(cx).can_change_schema(cx)) {
+                        structure.update(cx, |structure, cx| structure.reject_change("Save or cancel row edits and wait for table operations to finish before changing its structure.".into(), cx));
+                        return;
+                    }
+                    for table in tables { table.update(cx, |table, cx| table.begin_schema_change(cx)); }
+                    structure.update(cx, |structure, cx| structure.apply(sql.clone(), window, cx));
+                }
+                schema_view::SchemaEvent::Changed(changed) => {
+                    for table in tables { table.update(cx, |table, cx| table.finish_schema_change(*changed, window, cx)); }
+                }
+                schema_view::SchemaEvent::EditSql(sql) => view.open_sql_draft(request, Some(sql.clone()), window, cx),
+            }
+        }).detach();
+        self.tabs.push(WorkspaceTab::Structure(structure));
         self.select_tab(self.tabs.len() - 1, window, cx);
     }
 
@@ -283,6 +360,11 @@ impl AppView {
             return;
         };
         match &self.tabs[ix] {
+            WorkspaceTab::Structure(view) => {
+                if view.read(cx).is_running() {
+                    return;
+                }
+            }
             WorkspaceTab::Table(table) => {
                 if !table.update(cx, |table, cx| table.prepare_to_close(cx)) {
                     self.select_tab(ix, window, cx);
@@ -336,7 +418,10 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sql_active = matches!(self.tabs.get(self.active_tab), Some(WorkspaceTab::Sql(..)));
+        let sql_active = matches!(
+            self.tabs.get(self.active_tab),
+            Some(WorkspaceTab::Sql(..) | WorkspaceTab::Structure(..))
+        );
         let workspace = h_resizable("workspace")
             .child(
                 resizable_panel()
@@ -392,29 +477,57 @@ impl Render for AppView {
                                     .children(self.tabs.iter().map(|tab| {
                                         let id = tab.id();
                                         let label = tab.label(cx);
-                                        let running = matches!(tab, WorkspaceTab::Sql(editor, _) if editor.read(cx).is_running());
+                                        let running = match tab {
+                                            WorkspaceTab::Sql(editor, _) => {
+                                                editor.read(cx).is_running()
+                                            }
+                                            WorkspaceTab::Structure(view) => {
+                                                view.read(cx).is_running()
+                                            }
+                                            _ => false,
+                                        };
                                         Tab::new().label(label.clone()).suffix(
                                             Button::new(("close-tab", id))
-                                                .ghost().xsmall().icon(IconName::Close)
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Close)
                                                 .accessibility_label(format!("Close {label}"))
-                                                .tooltip(if running { "Wait for the query to finish" } else { "Close tab" })
+                                                .tooltip(if running {
+                                                    "Wait for the query to finish"
+                                                } else {
+                                                    "Close tab"
+                                                })
                                                 .disabled(running)
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                                .on_click(cx.listener(move |view, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    view.close_tab(id, window, cx);
-                                                })),
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation()
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |view, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        view.close_tab(id, window, cx);
+                                                    },
+                                                )),
                                         )
                                     }))
-                                    .on_click(cx.listener(|view, ix, window, cx| view.select_tab(*ix, window, cx))),
+                                    .on_click(cx.listener(|view, ix, window, cx| {
+                                        view.select_tab(*ix, window, cx)
+                                    })),
                             )
                         })
                         .when_some(self.tabs.get(self.active_tab), |content, tab| {
                             let child = match tab {
                                 WorkspaceTab::Table(table) => table.clone().into_any_element(),
                                 WorkspaceTab::Sql(editor, _) => editor.clone().into_any_element(),
+                                WorkspaceTab::Structure(view) => view.clone().into_any_element(),
                             };
-                            content.child(div().id(("tab-content", tab.id())).flex_1().min_h_0().min_w_0().child(child))
+                            content.child(
+                                div()
+                                    .id(("tab-content", tab.id()))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .child(child),
+                            )
                         }),
                 ),
             );
@@ -483,6 +596,22 @@ impl Render for AppView {
                         .w_full()
                         .justify_end()
                         .gap_2()
+                        .child(
+                            Button::new("toolbar-structure")
+                                .ghost()
+                                .label("Structure")
+                                .disabled(
+                                    self.tabs
+                                        .get(self.active_tab)
+                                        .and_then(|tab| tab.request(cx))
+                                        .is_none(),
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    cx.stop_propagation();
+                                    view.open_structure(window, cx);
+                                })),
+                        )
                         .child(
                             Button::new("toolbar-sql-editor")
                                 .ghost()

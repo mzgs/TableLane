@@ -237,6 +237,12 @@ impl SqlEditor {
         self.running
     }
 
+    pub(crate) fn set_sql(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_value(sql, window, cx));
+        cx.notify();
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.read(cx).focus_handle(cx).focus(window, cx);
     }
