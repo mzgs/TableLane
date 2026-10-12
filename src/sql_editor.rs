@@ -219,6 +219,11 @@ pub(crate) struct SqlEditor {
 }
 
 impl SqlEditor {
+    #[cfg(test)]
+    pub(crate) fn isolate_test_history(cx: &mut App) {
+        cx.set_global(History::for_test());
+    }
+
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::from_draft(SqlDraft::new(&request), Some(request), window, cx)
     }
@@ -248,8 +253,7 @@ impl SqlEditor {
             input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
                 tables: request
                     .as_ref()
-                    .and_then(|request| request.session.databases.get(&request.database))
-                    .cloned()
+                    .and_then(|request| request.session.databases().get(&request.database).cloned())
                     .unwrap_or_default(),
             }));
             input
@@ -278,6 +282,10 @@ impl SqlEditor {
             export_status: None,
             export_failed: false,
         }
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.running || self.exporting
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -314,8 +322,21 @@ impl SqlEditor {
         &self.draft.database
     }
 
-    pub(crate) fn connection_key(&self) -> &str {
-        &self.draft.connection_key
+    pub(crate) fn detach(&mut self, cx: &mut Context<Self>) {
+        self.request = None;
+        self.refresh_completions(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_completions(&self, cx: &mut Context<Self>) {
+        let tables = self
+            .request
+            .as_ref()
+            .and_then(|request| request.session.databases().get(&request.database).cloned())
+            .unwrap_or_default();
+        self.input.update(cx, |input, _| {
+            input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions { tables }));
+        });
     }
 
     pub(crate) fn attach(
@@ -326,14 +347,14 @@ impl SqlEditor {
     ) {
         if self.request.is_some()
             || session.connection_key() != self.draft.connection_key
-            || !session.databases.contains_key(&self.draft.database)
+            || !session.databases().contains_key(&self.draft.database)
         {
             return;
         }
         self.input.update(cx, |input, _| {
             input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
                 tables: session
-                    .databases
+                    .databases()
                     .get(&self.draft.database)
                     .cloned()
                     .unwrap_or_default(),
@@ -670,11 +691,11 @@ impl Render for SqlEditor {
                     )
                     .child(div().truncate().child(self.draft.database.clone())),
             )
-            .when(self.request.is_none(), |view| view.child(
+            .when(self.request.as_ref().is_none_or(|request| !request.session.is_connected()), |view| view.child(
                 div().id("sql-offline").test_support().role(Role::Status)
-                    .aria_label("Draft restored offline. Connect its saved connection in the sidebar to run SQL.")
+                    .aria_label("Offline. Connect its saved connection in the sidebar to run SQL.")
                     .px_3().pb_2().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Draft restored offline. Connect its saved connection in the sidebar to run SQL.")))
+                    .child("Offline. Connect its saved connection in the sidebar to run SQL.")))
             .child(
                 div().id("sql-input").p_3().flex_shrink_0().child(
                     Editor::new(&self.input)
@@ -698,7 +719,7 @@ impl Render for SqlEditor {
                             .label("Run")
                             .tooltip("Run selected SQL, or the whole statement (Cmd/Ctrl+Enter)")
                             .loading(self.running)
-                            .disabled(self.running || self.exporting || self.request.is_none() || self.input.read(cx).value().trim().is_empty())
+                            .disabled(self.running || self.exporting || self.request.as_ref().is_none_or(|request| !request.session.is_connected()) || self.input.read(cx).value().trim().is_empty())
                             .on_click(cx.listener(|editor, _, window, cx| editor.run(window, cx))),
                     )
                     .child(
@@ -828,7 +849,7 @@ mod tests {
     async fn mariadb_restored_drafts_attach_only_to_their_connection_without_execution(
         cx: &mut TestAppContext,
     ) {
-        use crate::workspace_state::{SqlDraft, WorkspaceFile, WorkspaceState};
+        use crate::workspace_state::{SavedTab, SqlDraft, WorkspaceFile, WorkspaceState};
         let directory =
             std::env::temp_dir().join(format!("tablelane-workspace-live-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
@@ -851,30 +872,30 @@ mod tests {
         wrong.username = "another-user".into();
         let mut state = WorkspaceState::default();
         state.tabs = vec![
-            SqlDraft {
+            SavedTab::Sql(SqlDraft {
                 number: 1,
                 connection_key: config.key(),
                 connection_name: "Old name".into(),
                 database: "tablelane_test".into(),
                 table: "widgets".into(),
                 sql: "SELECT @recovery_runs := COALESCE(@recovery_runs, 0) + 1".into(),
-            },
-            SqlDraft {
+            }),
+            SavedTab::Sql(SqlDraft {
                 number: 2,
                 connection_key: config.key(),
                 connection_name: "Old name".into(),
                 database: "missing_database".into(),
                 table: String::new(),
                 sql: "SELECT 2".into(),
-            },
-            SqlDraft {
+            }),
+            SavedTab::Sql(SqlDraft {
                 number: 3,
                 connection_key: wrong.key(),
                 connection_name: "Old name".into(),
                 database: "tablelane_test".into(),
                 table: "widgets".into(),
                 sql: "SELECT 3".into(),
-            },
+            }),
         ];
         assert!(
             WorkspaceFile::load(Some(directory.join("workspace.json")))
@@ -937,7 +958,7 @@ mod tests {
             assert_eq!(editors[0].read(cx).connection_name(), "Renamed");
             assert!(!editors[0].read(cx).is_running());
             assert!(editors[0].read(cx).results.is_none());
-            assert_eq!(editors[0].read(cx).draft(cx).sql, state.tabs[0].sql);
+            assert_eq!(editors[0].read(cx).draft(cx).sql, state.tabs[0].sql().sql);
             assert!(editors[1].read(cx).request().is_none());
             assert!(editors[2].read(cx).request().is_none());
             editors[0].read(cx).request().unwrap().session.clone()
@@ -946,6 +967,62 @@ mod tests {
             async_std::task::block_on(session.run_sql("tablelane_test", "SELECT @recovery_runs"))
                 .unwrap();
         assert_eq!(result.rows[0][0], None);
+        // Metadata refresh replaces completions on already attached editors without rerunning drafts.
+        for refreshed in [false, true] {
+            if refreshed {
+                async_std::task::block_on(session.run_sql(
+                    "tablelane_test",
+                    "CREATE TABLE refresh_completions_added (id INT PRIMARY KEY)",
+                ))
+                .unwrap();
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.click("refresh-connection-metadata", cx)
+                })
+                .unwrap();
+                cx.wait_for(handle.into(), timeout, |_, cx| {
+                    !app.read(cx).connections.read(cx).is_connecting()
+                })
+                .await;
+            }
+            let task = cx
+                .update_window(handle.into(), |_, window, cx| {
+                    let text = super::Rope::from("SELECT * FROM refresh_completions_added");
+                    let provider = editors[0]
+                        .read(cx)
+                        .input
+                        .read(cx)
+                        .lsp()
+                        .completion_provider
+                        .as_ref()
+                        .unwrap()
+                        .clone();
+                    provider.completions(
+                        &text,
+                        text.len(),
+                        lsp_types::CompletionContext {
+                            trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                            trigger_character: None,
+                        },
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+            let lsp_types::CompletionResponse::Array(items) = task.await.unwrap() else {
+                panic!("completion array")
+            };
+            assert_eq!(
+                items
+                    .iter()
+                    .any(|item| item.label == "refresh_completions_added"),
+                refreshed
+            );
+            cx.update(|cx| assert_eq!(editors[0].read(cx).draft(cx).sql, state.tabs[0].sql().sql));
+        }
+        async_std::task::block_on(
+            session.run_sql("tablelane_test", "DROP TABLE refresh_completions_added"),
+        )
+        .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("sql-offline").is_none());
@@ -990,8 +1067,8 @@ mod tests {
         .unwrap();
         let saved = WorkspaceFile::load(Some(directory.join("workspace.json"))).1;
         assert_eq!(saved.tabs.len(), 4);
-        assert_eq!(saved.tabs[3].number, 4);
-        assert_eq!(saved.tabs[3].sql, "SELECT 'new draft 保存'");
+        assert_eq!(saved.tabs[3].sql().number, 4);
+        assert_eq!(saved.tabs[3].sql().sql, "SELECT 'new draft 保存'");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1075,6 +1152,7 @@ mod tests {
             window.click("export-sql-json", cx);
             window.click("export-sql-csv", cx);
             assert!(editor.read(cx).exporting);
+            assert!(editor.read(cx).is_busy());
         })
         .unwrap();
         cx.run_until_parked();
@@ -1384,6 +1462,15 @@ mod tests {
             );
         })
         .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(first.read(cx).is_running());
+            app.update(cx, |app, cx| assert!(!app.prepare_close(false, window, cx)));
+            window.render_frame(cx);
+            assert_eq!(window.within("dialog").find("ok").label(), Some("OK"));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
         let second = second.unwrap();
         cx.wait_for(handle.into(), timeout, |_, cx| !first.read(cx).is_running())
             .await;

@@ -2,13 +2,14 @@ use crate::{
     data_export::{ExportFormat, ExportWriter, QueryExport},
     settings::{Connection, DatabaseKind},
 };
+use serde::{Deserialize, Serialize};
 use sqlx::{Column as _, Connection as _, Executor as _, MySqlConnection, Row, TypeInfo as _};
 use std::collections::BTreeMap;
 
 const CELL_PREVIEW_CHARS: usize = 200;
 pub(crate) const PAGE_SIZE: usize = 1000;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum FilterOperator {
     Contains,
     NotContains,
@@ -52,14 +53,14 @@ impl FilterOperator {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableFilter {
     pub(crate) column: Option<String>,
     pub(crate) operator: FilterOperator,
     pub(crate) value: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableQuery {
     pub(crate) page: usize,
     pub(crate) filters: Vec<TableFilter>,
@@ -182,8 +183,9 @@ impl TableQuery {
 
 pub(crate) struct Session {
     connection_key: String,
-    connection: async_std::sync::Mutex<MySqlConnection>,
-    pub(crate) databases: BTreeMap<String, Vec<String>>,
+    connection: async_std::sync::Mutex<Option<MySqlConnection>>,
+    databases: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
+    error: std::sync::RwLock<Option<String>>,
 }
 
 #[non_exhaustive]
@@ -405,6 +407,85 @@ async fn read_schema(
 }
 
 impl Session {
+    pub(crate) fn databases(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Vec<String>>> {
+        self.databases.read().unwrap()
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error.read().unwrap().clone()
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.error.read().unwrap().is_none()
+    }
+
+    pub(crate) fn disconnect(&self) {
+        *self.error.write().unwrap() = Some("Disconnected".into());
+    }
+
+    fn database_error(&self, error: sqlx::Error) -> String {
+        if matches!(
+            error,
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::WorkerCrashed
+        ) {
+            *self.error.write().unwrap() = Some(format!("Connection lost: {error}"));
+        }
+        error.to_string()
+    }
+
+    pub(crate) async fn close(&self) {
+        self.connection.lock().await.take();
+    }
+
+    async fn connection(
+        &self,
+    ) -> Result<async_std::sync::MutexGuard<'_, Option<MySqlConnection>>, sqlx::Error> {
+        let connection = self.connection.lock().await;
+        if let Some(error) = self.error() {
+            return Err(sqlx::Error::Protocol(format!(
+                "{error}. Reconnect in the sidebar."
+            )));
+        }
+        Ok(connection)
+    }
+
+    // Skip busy sessions: a health check must never wait behind or cancel a user query.
+    pub(crate) async fn check_health(&self) {
+        let Some(mut connection) = self.connection.try_lock() else {
+            return;
+        };
+        if !self.is_connected() {
+            connection.take();
+            return;
+        }
+        let result = async_std::future::timeout(
+            std::time::Duration::from_secs(5),
+            connection.as_mut().unwrap().ping(),
+        )
+        .await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => format!("Connection lost: {error}"),
+            Err(_) => "Connection health check timed out".into(),
+        };
+        *self.error.write().unwrap() = Some(error);
+        connection.take();
+    }
+
+    pub(crate) async fn refresh_metadata(&self) -> Result<(), String> {
+        async_std::future::timeout(std::time::Duration::from_secs(15), async {
+            let mut connection = self.connection().await?;
+            let databases = read_databases(connection.as_mut().unwrap()).await?;
+            *self.databases.write().unwrap() = databases;
+            Ok::<_, sqlx::Error>(())
+        })
+        .await
+        .map_err(|_| "Refreshing metadata timed out. Try again.".to_owned())?
+        .map_err(|error| format!("Couldn’t refresh metadata: {}", self.database_error(error)))
+    }
+
     pub(crate) fn connection_key(&self) -> &str {
         &self.connection_key
     }
@@ -415,7 +496,8 @@ impl Session {
         table: &str,
     ) -> Result<TableStructure, String> {
         async_std::future::timeout(std::time::Duration::from_secs(15), async {
-            let mut connection = self.connection.lock().await;
+            let mut guard = self.connection().await?;
+            let connection = guard.as_mut().unwrap();
             let sql_mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *connection).await?;
             let ddl = sqlx::query(&format!("SHOW CREATE TABLE {}.{}", quote_identifier(database), quote_identifier(table)))
                 .fetch_one(&mut *connection).await?.try_get(1)?;
@@ -433,7 +515,7 @@ impl Session {
                 no_backslash_escapes: sql_mode.split(',').any(|mode| mode == "NO_BACKSLASH_ESCAPES"),
             })
         }).await.map_err(|_| "Loading table structure timed out. Try Refresh.".to_owned())?
-            .map_err(|error| format!("Couldn’t load table structure: {error}"))
+            .map_err(|error| format!("Couldn’t load table structure: {}", self.database_error(error)))
     }
 
     pub(crate) async fn run_sql(
@@ -472,7 +554,8 @@ impl Session {
             return Err("Enter a SQL statement to run.".into());
         }
         let result = async {
-            let mut connection = self.connection.lock().await;
+            let mut guard = self.connection().await?;
+            let connection = guard.as_mut().unwrap();
             sqlx::query(&format!("USE {}", quote_identifier(database)))
                 .execute(&mut *connection)
                 .await?;
@@ -556,7 +639,7 @@ impl Session {
             Ok::<_, sqlx::Error>((data, affected))
         }
         .await;
-        result.map_err(|error| format!("Couldn’t run SQL: {error}"))
+        result.map_err(|error| format!("Couldn’t run SQL: {}", self.database_error(error)))
     }
 
     pub(crate) async fn read_table(
@@ -566,8 +649,9 @@ impl Session {
         options: &TableQuery,
     ) -> Result<TableRows, String> {
         async_std::future::timeout(std::time::Duration::from_secs(15), async {
-            let mut connection = self.connection.lock().await;
-            let schema = read_schema(&mut connection, database, table).await?;
+            let mut guard = self.connection().await?;
+            let connection = guard.as_mut().unwrap();
+            let schema = read_schema(connection, database, table).await?;
             let mut expressions = (0..schema.columns.len())
                 .map(|ix| schema.expression(ix, true))
                 .collect::<Vec<_>>();
@@ -625,7 +709,10 @@ impl Session {
         .await
         .map_err(|_| "Loading table timed out. Double-click the table to try again.".to_owned())?
         .map_err(|error| {
-            format!("Couldn’t load table: {error}. Double-click the table to try again.")
+            format!(
+                "Couldn’t load table: {}. Double-click the table to try again.",
+                self.database_error(error)
+            )
         })
     }
 
@@ -638,8 +725,11 @@ impl Session {
         format: ExportFormat,
     ) -> anyhow::Result<usize> {
         use async_std::stream::StreamExt;
-        let mut connection = self.connection.lock().await;
-        let schema = read_schema(&mut connection, database, table).await?;
+        let mut guard = self.connection().await?;
+        let connection = guard.as_mut().unwrap();
+        let schema = read_schema(connection, database, table)
+            .await
+            .map_err(|error| anyhow::Error::msg(self.database_error(error)))?;
         let (clauses, values, _) = options.clauses(&schema).map_err(anyhow::Error::msg)?;
         let expressions = (0..schema.columns.len())
             .map(|ix| schema.expression(ix, false))
@@ -658,7 +748,7 @@ impl Session {
         let mut write_error = None;
         let mut stream = statement.fetch(&mut *connection);
         while let Some(row) = stream.next().await {
-            let row = row?;
+            let row = row.map_err(|error| anyhow::Error::msg(self.database_error(error)))?;
             if write_error.is_none() {
                 let result = (0..schema.columns.len())
                     .map(|ix| row.try_get(ix))
@@ -691,14 +781,18 @@ impl Session {
         for value in key {
             statement = statement.bind(value);
         }
-        let mut connection = self.connection.lock().await;
+        let mut guard = self
+            .connection()
+            .await
+            .map_err(|error| self.database_error(error))?;
+        let connection = guard.as_mut().unwrap();
         let row = statement
             .fetch_optional(&mut *connection)
             .await
-            .map_err(|error| format!("Couldn’t load row: {error}"))?
+            .map_err(|error| format!("Couldn’t load row: {}", self.database_error(error)))?
             .ok_or("This row no longer exists. Reopen the table to refresh it.")?;
         (0..schema.columns.len())
-            .map(|ix| row.try_get(ix).map_err(|error| error.to_string()))
+            .map(|ix| row.try_get(ix).map_err(|error| self.database_error(error)))
             .collect()
     }
 
@@ -768,8 +862,12 @@ impl Session {
             assignments.join(", "),
             predicates.join(" AND ")
         );
-        let mut connection = self.connection.lock().await;
-        let engine: Option<String> = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?").bind(database).bind(table).fetch_optional(&mut *connection).await.map_err(|error| error.to_string())?.flatten();
+        let mut guard = self
+            .connection()
+            .await
+            .map_err(|error| self.database_error(error))?;
+        let connection = guard.as_mut().unwrap();
+        let engine: Option<String> = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?").bind(database).bind(table).fetch_optional(&mut *connection).await.map_err(|error| self.database_error(error))?.flatten();
         if engine.as_deref() != Some("InnoDB") {
             return Err(
                 "Saving requires an InnoDB table so failed saves can be rolled back.".into(),
@@ -778,7 +876,7 @@ impl Session {
         let mut transaction = connection
             .begin()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| self.database_error(error))?;
         let result = async {
             let mut statement = sqlx::query(&query);
             for ix in &changed {
@@ -793,7 +891,7 @@ impl Session {
             let result = statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| format!("Couldn’t save row: {error}"))?;
+                .map_err(|error| format!("Couldn’t save row: {}", self.database_error(error)))?;
             if result.rows_affected() != 1 {
                 return Err(
                     "The row changed or was deleted. Cancel and reopen the table before saving."
@@ -803,13 +901,13 @@ impl Session {
             let warnings = sqlx::query("SHOW WARNINGS")
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| self.database_error(error))?;
             if let Some(warning) = warnings.first() {
                 return Err(format!(
                     "Save cancelled: {}",
                     warning
                         .try_get::<String, _>(2)
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| self.database_error(error))?
                 ));
             }
             let mut statement = sqlx::query(&row_query);
@@ -819,23 +917,22 @@ impl Session {
             let row = statement
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| self.database_error(error))?
                 .ok_or("Couldn’t verify the saved row; changes were rolled back.")?;
             (0..schema.columns.len())
-                .map(|ix| row.try_get(ix).map_err(|error| error.to_string()))
+                .map(|ix| row.try_get(ix).map_err(|error| self.database_error(error)))
                 .collect::<Result<Vec<Option<String>>, String>>()
         }
         .await;
         match result {
             Ok(row) => {
-                transaction.commit().await.map_err(|error| format!("Couldn’t confirm the save: {error}. Reselect the row to check its current values."))?;
+                transaction.commit().await.map_err(|error| format!("Couldn’t confirm the save: {}. Reselect the row to check its current values.", self.database_error(error)))?;
                 Ok(row)
             }
             Err(error) => {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|rollback| format!("{error} Rollback failed: {rollback}"))?;
+                transaction.rollback().await.map_err(|rollback| {
+                    format!("{error} Rollback failed: {}", self.database_error(rollback))
+                })?;
                 Err(error)
             }
         }
@@ -864,30 +961,190 @@ fn connection_url(connection: &Connection) -> Result<url::Url, String> {
     Ok(url)
 }
 
-pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> {
-    let url = connection_url(connection)?;
-    async_std::future::timeout(std::time::Duration::from_secs(15), async {
-        let mut session = MySqlConnection::connect(url.as_str()).await?;
-        let mut databases = BTreeMap::new();
-        for row in sqlx::query("SHOW DATABASES").fetch_all(&mut session).await? {
-            databases.insert(row.try_get::<String, _>(0)?, Vec::new());
-        }
-        for row in sqlx::query(
+async fn read_databases(
+    connection: &mut MySqlConnection,
+) -> Result<BTreeMap<String, Vec<String>>, sqlx::Error> {
+    let mut databases = BTreeMap::new();
+    for row in sqlx::query("SHOW DATABASES")
+        .fetch_all(&mut *connection)
+        .await?
+    {
+        databases.insert(row.try_get::<String, _>(0)?, Vec::new());
+    }
+    for row in sqlx::query(
             "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME",
-        ).fetch_all(&mut session).await? {
+        ).fetch_all(&mut *connection).await? {
             let schema: String = row.try_get(0)?;
             if let Some(tables) = databases.get_mut(&schema) {
                 tables.push(row.try_get(1)?);
             }
         }
-        Ok::<_, sqlx::Error>(Session { connection_key: connection.key(), connection: async_std::sync::Mutex::new(session), databases })
-    }).await.map_err(|_| "Connection timed out. Check the host and port, then try again.".to_owned())?
-        .map_err(|error| format!("Couldn’t connect or load databases: {error}"))
+    Ok(databases)
+}
+
+pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> {
+    let url = connection_url(connection)?;
+    async_std::future::timeout(std::time::Duration::from_secs(15), async {
+        let mut session = MySqlConnection::connect(url.as_str()).await?;
+        let databases = read_databases(&mut session).await?;
+        Ok::<_, sqlx::Error>(Session {
+            connection_key: connection.key(),
+            connection: async_std::sync::Mutex::new(Some(session)),
+            databases: std::sync::RwLock::new(databases),
+            error: std::sync::RwLock::new(None),
+        })
+    })
+    .await
+    .map_err(|_| "Connection timed out. Check the host and port, then try again.".to_owned())?
+    .map_err(|error| format!("Couldn’t connect or load databases: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FilterOperator, TableFilter};
+
+    #[test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    fn mariadb_metadata_health_and_disconnect_preserve_session_boundaries() {
+        use sqlx::{Connection as _, Row as _};
+        async_std::task::block_on(async {
+            let config = crate::settings::Connection {
+                name: "Lifecycle".into(),
+                database_type: crate::settings::DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(
+                    std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                ),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            };
+            let session = super::connect(&config).await.unwrap();
+            session
+                .run_sql("mysql", "CREATE DATABASE lifecycle_health_test")
+                .await
+                .unwrap();
+            session
+                .run_sql(
+                    "lifecycle_health_test",
+                    "CREATE TABLE added (id INT PRIMARY KEY)",
+                )
+                .await
+                .unwrap();
+            session
+                .run_sql("mysql", "SET @metadata_counter = 42")
+                .await
+                .unwrap();
+            assert!(!session.databases().contains_key("lifecycle_health_test"));
+            session.refresh_metadata().await.unwrap();
+            assert_eq!(session.databases()["lifecycle_health_test"], vec!["added"]);
+            let (rows, _) = session
+                .run_sql("mysql", "SELECT @metadata_counter, CONNECTION_ID()")
+                .await
+                .unwrap();
+            assert_eq!(rows.rows[0][0].as_deref(), Some("42"));
+            let id = rows.rows[0][1].as_ref().unwrap();
+            let guard = session.connection.lock().await;
+            async_std::future::timeout(
+                std::time::Duration::from_millis(50),
+                session.check_health(),
+            )
+            .await
+            .unwrap();
+            assert!(session.is_connected());
+            drop(guard);
+            let mut admin =
+                sqlx::MySqlConnection::connect(super::connection_url(&config).unwrap().as_str())
+                    .await
+                    .unwrap();
+            sqlx::query(&format!("KILL CONNECTION {id}"))
+                .execute(&mut admin)
+                .await
+                .unwrap();
+            session.check_health().await;
+            assert!(!session.is_connected());
+            assert!(session.error().unwrap().contains("Connection lost"));
+            assert!(session.connection.lock().await.is_none());
+            assert!(
+                session
+                    .run_sql("lifecycle_health_test", "INSERT INTO added VALUES (1)")
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains("Reconnect")
+            );
+            let before = session.databases().clone();
+            assert!(session.refresh_metadata().await.is_err());
+            assert_eq!(*session.databases(), before);
+            assert_eq!(
+                sqlx::query("SELECT COUNT(*) FROM lifecycle_health_test.added")
+                    .fetch_one(&mut admin)
+                    .await
+                    .unwrap()
+                    .get::<i64, _>(0),
+                0
+            );
+            let replacement = super::connect(&config).await.unwrap();
+            replacement
+                .run_sql("lifecycle_health_test", "START TRANSACTION")
+                .await
+                .unwrap();
+            replacement
+                .run_sql("lifecycle_health_test", "INSERT INTO added VALUES (1)")
+                .await
+                .unwrap();
+            replacement.disconnect();
+            assert!(
+                replacement
+                    .read_table(
+                        "lifecycle_health_test",
+                        "added",
+                        &super::TableQuery::default()
+                    )
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains("Disconnected")
+            );
+            replacement.close().await;
+            assert!(replacement.connection.lock().await.is_none());
+            assert_eq!(
+                sqlx::query("SELECT COUNT(*) FROM lifecycle_health_test.added")
+                    .fetch_one(&mut admin)
+                    .await
+                    .unwrap()
+                    .get::<i64, _>(0),
+                0
+            );
+            let transport = super::connect(&config).await.unwrap();
+            let (rows, _) = transport
+                .run_sql("mysql", "SELECT CONNECTION_ID()")
+                .await
+                .unwrap();
+            sqlx::query(&format!(
+                "KILL CONNECTION {}",
+                rows.rows[0][0].as_ref().unwrap()
+            ))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+            assert!(transport.run_sql("mysql", "SELECT 1").await.is_err());
+            assert!(
+                !transport.is_connected(),
+                "operation errors must invalidate a broken session before the next health check"
+            );
+            transport.close().await;
+            session.close().await;
+            sqlx::query("DROP DATABASE lifecycle_health_test")
+                .execute(&mut admin)
+                .await
+                .unwrap();
+        });
+    }
 
     fn contains(column: &str, value: &str) -> TableFilter {
         TableFilter {
@@ -1057,7 +1314,8 @@ mod tests {
             })
             .await
             .unwrap();
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("CREATE DATABASE browse_test")
                 .execute(&mut *connection)
                 .await
@@ -1069,7 +1327,7 @@ mod tests {
                 .execute(&mut *connection)
                 .await
                 .unwrap();
-            drop(connection);
+            drop(guard);
             let mut query = TableQuery::default();
             let first = session
                 .read_table("browse_test", "widgets", &query)
@@ -1240,7 +1498,7 @@ mod tests {
                 assert!(!result.has_more);
             }
             sqlx::query("UPDATE browse_test.widgets SET body = NULL WHERE id = 2005")
-                .execute(&mut *session.connection.lock().await)
+                .execute(session.connection.lock().await.as_mut().unwrap())
                 .await
                 .unwrap();
             let result = session
@@ -1250,7 +1508,7 @@ mod tests {
             assert_eq!(result.rows.len(), 2);
             assert_eq!(result.rows[1][0].as_deref(), Some("2005"));
             sqlx::query("DROP DATABASE browse_test")
-                .execute(&mut *session.connection.lock().await)
+                .execute(session.connection.lock().await.as_mut().unwrap())
                 .await
                 .unwrap();
         });
@@ -1281,14 +1539,15 @@ mod tests {
         };
         async_std::task::block_on(async {
             let session = super::connect(&config).await.unwrap();
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("CREATE DATABASE row_editor_test")
                 .execute(&mut *connection)
                 .await
                 .unwrap();
             sqlx::query("CREATE TABLE row_editor_test.`edit``rows` (id INT, token VARCHAR(300), body LONGTEXT, nullable TEXT, bytes BLOB, short VARCHAR(8), computed INT AS (id + 1) STORED, PRIMARY KEY (id, token)) ENGINE=InnoDB").execute(&mut *connection).await.unwrap();
             sqlx::query("INSERT INTO row_editor_test.`edit``rows` (id, token, body, nullable, bytes, short) VALUES (1, ?, ?, NULL, X'00FF', 'old')").bind("ع".repeat(260)).bind("世界".repeat(500)).execute(&mut *connection).await.unwrap();
-            drop(connection);
+            drop(guard);
             let data = session
                 .read_table(
                     "row_editor_test",
@@ -1367,12 +1626,13 @@ mod tests {
                     .unwrap_err()
                     .contains("cannot be edited")
             );
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("SET SESSION sql_mode = ''")
                 .execute(&mut *connection)
                 .await
                 .unwrap();
-            drop(connection);
+            drop(guard);
             invalid = saved.clone();
             invalid[5] = Some("too long to fit".into());
             assert!(
@@ -1398,12 +1658,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reread, saved);
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("UPDATE row_editor_test.`edit``rows` SET short = 'external'")
                 .execute(&mut *connection)
                 .await
                 .unwrap();
-            drop(connection);
+            drop(guard);
             values = saved.clone();
             values[2] = Some("overwrite".into());
             assert!(
@@ -1440,7 +1701,7 @@ mod tests {
                     .contains("primary key")
             );
             sqlx::query("DROP DATABASE row_editor_test")
-                .execute(&mut *session.connection.lock().await)
+                .execute(session.connection.lock().await.as_mut().unwrap())
                 .await
                 .unwrap();
         });
@@ -1486,8 +1747,8 @@ mod tests {
             file_path: String::new(),
         };
         let session = async_std::task::block_on(super::connect(&connection)).unwrap();
-        assert_eq!(session.databases["tablelane_test"], vec!["widgets"]);
-        assert!(session.databases["empty_db"].is_empty());
+        assert_eq!(session.databases()["tablelane_test"], vec!["widgets"]);
+        assert!(session.databases()["empty_db"].is_empty());
         let rows = async_std::task::block_on(session.read_table(
             "tablelane_test",
             "widgets",
@@ -1504,7 +1765,8 @@ mod tests {
             .is_err()
         );
         async_std::task::block_on(async {
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             for query in [
                 "CREATE DATABASE `preview``test`",
                 "CREATE TABLE `preview``test`.`types``/table` (`number` BIGINT UNSIGNED, `amount` DECIMAL(20,4), `date` DATETIME, `text``value` LONGTEXT, `bytes` LONGBLOB, `nullable` TEXT)",
@@ -1512,7 +1774,7 @@ mod tests {
             ] {
                 sqlx::query(query).execute(&mut *connection).await.unwrap();
             }
-            drop(connection);
+            drop(guard);
             let rows = session
                 .read_table(
                     "preview`test",
@@ -1550,10 +1812,11 @@ mod tests {
                 &rows.schema.column_types[2..],
                 ["datetime", "longtext", "longblob", "text"]
             );
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("UPDATE `preview``test`.`types``/table` SET `text``value` = REPEAT('ع', 100000), `bytes` = REPEAT(X'FF', 100000)")
                 .execute(&mut *connection).await.unwrap();
-            drop(connection);
+            drop(guard);
             let preview = session
                 .read_table(
                     "preview`test",
@@ -1565,13 +1828,14 @@ mod tests {
             assert_eq!(preview.rows[0][3], Some(format!("{}…", "ع".repeat(200))));
             assert_eq!(preview.rows[0][4], Some(format!("{}…", "FF".repeat(100))));
             assert_eq!(preview.rows[0][5], None);
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("UPDATE `preview``test`.`types``/table` SET `text``value` = 'hello 世界', `bytes` = X'00FF'")
                 .execute(&mut *connection).await.unwrap();
             for _ in 0..10 {
                 sqlx::query("INSERT INTO `preview``test`.`types``/table` SELECT * FROM `preview``test`.`types``/table`").execute(&mut *connection).await.unwrap();
             }
-            drop(connection);
+            drop(guard);
             assert_eq!(
                 session
                     .read_table(
@@ -1585,12 +1849,13 @@ mod tests {
                     .len(),
                 1000
             );
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("TRUNCATE TABLE `preview``test`.`types``/table`")
                 .execute(&mut *connection)
                 .await
                 .unwrap();
-            drop(connection);
+            drop(guard);
             let empty = session
                 .read_table(
                     "preview`test",
@@ -1602,7 +1867,8 @@ mod tests {
             assert_eq!(empty.schema.columns.len(), 6);
             assert_eq!(empty.schema.column_types, rows.schema.column_types);
             assert!(empty.rows.is_empty());
-            let mut connection = session.connection.lock().await;
+            let mut guard = session.connection.lock().await;
+            let connection = guard.as_mut().unwrap();
             sqlx::query("DROP DATABASE `preview``test`")
                 .execute(&mut *connection)
                 .await

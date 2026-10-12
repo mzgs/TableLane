@@ -4,7 +4,9 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        ActiveTheme, Icon, Sizable, h_flex,
+        ActiveTheme, Disableable, Icon, Sizable,
+        button::{Button, ButtonVariants},
+        h_flex,
         list::ListItem,
         tree::{TreeItem, TreeState, tree},
     },
@@ -18,6 +20,7 @@ struct Entry {
     loading: bool,
     session: Option<std::sync::Arc<database::Session>>,
     error: Option<String>,
+    saved: bool,
 }
 
 pub(crate) struct Connections {
@@ -39,6 +42,21 @@ pub(crate) struct OpenTable {
 
 impl EventEmitter<OpenTable> for Connections {}
 
+#[derive(Clone)]
+#[non_exhaustive]
+pub(crate) struct ManageConnection {
+    pub(crate) id: SharedString,
+    pub(crate) reconnect: bool,
+}
+impl EventEmitter<ManageConnection> for Connections {}
+
+#[non_exhaustive]
+pub(crate) struct SessionReady {
+    pub(crate) session: std::sync::Arc<database::Session>,
+    pub(crate) name: String,
+}
+impl EventEmitter<SessionReady> for Connections {}
+
 impl Connections {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         cx.bind_keys([KeyBinding::new(
@@ -57,6 +75,40 @@ impl Connections {
         view.sync(cx);
         cx.observe_global::<Settings>(|view, cx| view.sync(cx))
             .detach();
+        // shortcut: health polling can lag by 30 seconds; shorten the interval if faster detection is needed.
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                let Ok(sessions) = view.update(cx, |view, _| {
+                    view.entries
+                        .iter()
+                        .filter_map(|entry| entry.session.clone())
+                        .collect::<Vec<_>>()
+                }) else {
+                    break;
+                };
+                cx.background_spawn(async move {
+                    async_std::task::block_on(async {
+                        let checks = sessions
+                            .into_iter()
+                            .map(|session| {
+                                async_std::task::spawn(async move { session.check_health().await })
+                            })
+                            .collect::<Vec<_>>();
+                        for check in checks {
+                            check.await;
+                        }
+                    });
+                })
+                .await;
+                if view.update(cx, |view, cx| view.update_tree(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         view
     }
 
@@ -87,7 +139,10 @@ impl Connections {
             .into_iter()
             .map(|config| {
                 if let Some(ix) = previous.iter().position(|entry| entry.config == config) {
-                    previous.remove(ix)
+                    let mut entry = previous.remove(ix);
+                    entry.saved = true;
+                    entry.item.label = config.name.clone().into();
+                    entry
                 } else {
                     self.next_id += 1;
                     Entry {
@@ -99,14 +154,31 @@ impl Connections {
                         loading: false,
                         session: None,
                         error: None,
+                        saved: true,
                     }
                 }
             })
             .collect();
+        // Open tabs can retain a session after its saved connection is edited or deleted.
+        for mut entry in previous {
+            if entry.session.is_some() {
+                entry.saved = false;
+                entry.item.label = format!("{} · Previous session", entry.config.name).into();
+                self.entries.push(entry);
+            }
+        }
         self.update_tree(cx);
     }
 
-    fn update_tree(&self, cx: &mut Context<Self>) {
+    fn update_tree(&mut self, cx: &mut Context<Self>) {
+        for entry in &mut self.entries {
+            if let Some(session) = &entry.session
+                && let Some(error) = session.error()
+            {
+                entry.error = Some(error);
+                entry.item.children.clear();
+            }
+        }
         let items = self
             .entries
             .iter()
@@ -114,8 +186,20 @@ impl Connections {
             .collect::<Vec<_>>();
         self.tree.update(cx, |state, cx| {
             let selected = state.selected_item().cloned();
+            let root = selected.as_ref().and_then(|selected| {
+                items
+                    .iter()
+                    .find(|item| {
+                        selected.id == item.id
+                            || selected.id.starts_with(&format!("{}/database/", item.id))
+                    })
+                    .cloned()
+            });
             state.set_items(items, cx);
             state.set_selected_item(selected.as_ref(), cx);
+            if state.selected_item().is_none() {
+                state.set_selected_item(root.as_ref(), cx);
+            }
         });
         cx.notify();
     }
@@ -123,18 +207,137 @@ impl Connections {
     pub(crate) fn selected_connection(&self, cx: &App) -> Option<usize> {
         let id = &self.tree.read(cx).selected_item()?.id;
         self.entries.iter().position(|entry| {
-            *id == entry.item.id || id.starts_with(&format!("{}/database/", entry.item.id))
+            entry.saved
+                && (*id == entry.item.id || id.starts_with(&format!("{}/database/", entry.item.id)))
         })
     }
 
-    pub(crate) fn session_for(
+    pub(crate) fn is_connecting(&self) -> bool {
+        self.entries.iter().any(|entry| entry.loading)
+    }
+
+    pub(crate) fn refresh_health(&mut self, cx: &mut Context<Self>) {
+        if self.entries.iter().any(|entry| {
+            entry.session.as_ref().is_some_and(|session| {
+                session
+                    .error()
+                    .is_some_and(|error| entry.error.as_ref() != Some(&error))
+            })
+        }) {
+            self.update_tree(cx);
+        }
+    }
+
+    pub(crate) fn managed_session(
         &self,
-        key: &str,
-    ) -> Option<(std::sync::Arc<database::Session>, String)> {
-        self.entries.iter().find_map(|entry| {
-            let session = entry.session.as_ref()?;
-            (session.connection_key() == key).then(|| (session.clone(), entry.config.name.clone()))
+        id: &SharedString,
+    ) -> Option<std::sync::Arc<database::Session>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.item.id == *id)?
+            .session
+            .clone()
+    }
+
+    pub(crate) fn is_manageable(&self, command: &ManageConnection) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.item.id == command.id && !entry.loading && (!command.reconnect || entry.saved)
         })
+    }
+
+    pub(crate) fn manage(&mut self, command: &ManageConnection, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .entries
+            .iter()
+            .position(|entry| entry.item.id == command.id)
+        else {
+            return;
+        };
+        if self.entries[ix].loading || (command.reconnect && !self.entries[ix].saved) {
+            return;
+        }
+        self.entries[ix].session = None;
+        self.entries[ix].item.children.clear();
+        self.entries[ix].error = Some("Disconnected".into());
+        if !self.entries[ix].saved {
+            self.entries.remove(ix);
+        }
+        self.update_tree(cx);
+        if command.reconnect {
+            self.connect(&command.id, cx);
+        }
+    }
+
+    fn refresh_metadata(&mut self, id: &SharedString, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.item.id == *id) else {
+            return;
+        };
+        let Some(session) = entry
+            .session
+            .clone()
+            .filter(|session| session.is_connected())
+        else {
+            return;
+        };
+        if entry.loading {
+            return;
+        }
+        entry.loading = true;
+        entry.error = None;
+        let id = id.clone();
+        let task = cx
+            .background_spawn(async move { async_std::task::block_on(session.refresh_metadata()) });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |view, cx| {
+                let Some(entry) = view.entries.iter_mut().find(|entry| entry.item.id == id) else {
+                    return;
+                };
+                entry.loading = false;
+                match result {
+                    Ok(()) => {
+                        Self::load_children(entry);
+                        cx.emit(SessionReady {
+                            session: entry.session.as_ref().unwrap().clone(),
+                            name: entry.config.name.clone(),
+                        });
+                    }
+                    Err(error) => entry.error = Some(error),
+                }
+                view.update_tree(cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn load_children(entry: &mut Entry) {
+        let Some(session) = &entry.session else {
+            return;
+        };
+        entry.error = None;
+        entry.item.children = session
+            .databases()
+            .iter()
+            .map(|(name, tables)| {
+                let database_id = format!("{}/database/{name}", entry.item.id);
+                let mut database = entry
+                    .item
+                    .children
+                    .iter()
+                    .find(|item| item.id == database_id)
+                    .cloned()
+                    .unwrap_or_else(|| TreeItem::new(database_id.clone(), name.clone()));
+                database.children.clear();
+                database
+                    .children(tables.iter().map(|table| {
+                        TreeItem::new(format!("{database_id}/table/{table}"), table.clone())
+                    }))
+                    .children(tables.is_empty().then(|| {
+                        TreeItem::new(format!("{database_id}/empty"), "No tables").disabled(true)
+                    }))
+            })
+            .collect();
     }
 
     fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
@@ -163,7 +366,16 @@ impl Connections {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.item.id == *id) else {
             return;
         };
-        if entry.loading || entry.session.is_some() {
+        if entry.loading || !entry.saved {
+            return;
+        }
+        if let Some(session) = &entry.session {
+            if !session.is_connected() {
+                cx.emit(ManageConnection {
+                    id: id.clone(),
+                    reconnect: true,
+                });
+            }
             return;
         }
         entry.loading = true;
@@ -192,24 +404,14 @@ impl Connections {
         entry.loading = false;
         match result {
             Ok(session) => {
-                entry.item.children = session
-                    .databases
-                    .iter()
-                    .map(|(name, tables)| {
-                        let database_id = format!("{id}/database/{name}");
-                        TreeItem::new(database_id.clone(), name.clone())
-                            .children(tables.iter().map(|table| {
-                                TreeItem::new(format!("{database_id}/table/{table}"), table.clone())
-                            }))
-                            .children(tables.is_empty().then(|| {
-                                TreeItem::new(format!("{database_id}/empty"), "No tables")
-                                    .disabled(true)
-                            }))
-                    })
-                    .collect();
-                entry.item.clone().expanded(true);
                 entry.session = Some(std::sync::Arc::new(session));
+                Self::load_children(entry);
+                entry.item.clone().expanded(true);
                 entry.error = None;
+                cx.emit(SessionReady {
+                    session: entry.session.as_ref().unwrap().clone(),
+                    name: entry.config.name.clone(),
+                });
             }
             Err(error) => entry.error = Some(error),
         }
@@ -243,11 +445,16 @@ impl Render for Connections {
             .iter()
             .map(|entry| {
                 let text = if entry.loading {
-                    "Connecting…".to_owned()
+                    if entry.session.is_some() {
+                        "Refreshing metadata…"
+                    } else {
+                        "Connecting…"
+                    }
+                    .to_owned()
                 } else if let Some(error) = &entry.error {
                     error.clone()
                 } else if let Some(session) = &entry.session {
-                    if session.databases.is_empty() {
+                    if session.databases().is_empty() {
                         "Connected · No databases available".into()
                     } else {
                         "Connected".into()
@@ -257,16 +464,37 @@ impl Render for Connections {
                 };
                 (
                     entry.item.id.clone(),
-                    entry.session.is_some(),
+                    !entry.loading
+                        && entry
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.is_connected()),
                     text,
                     entry.error.is_some(),
                 )
             })
             .collect::<Vec<_>>();
-        let selected = self.tree.read(cx).selected_item();
+        let selected = self.tree.read(cx).selected_item().and_then(|item| {
+            self.entries.iter().find(|entry| {
+                entry.item.id == item.id
+                    || item.id.starts_with(&format!("{}/database/", entry.item.id))
+            })
+        });
         let status = selected
-            .and_then(|item| statuses.iter().find(|(id, ..)| *id == item.id))
+            .and_then(|entry| statuses.iter().find(|(id, ..)| *id == entry.item.id))
             .map(|(_, _, text, error)| (text.clone(), *error));
+        let controls = selected.map(|entry| {
+            (
+                entry.item.id.clone(),
+                entry.loading,
+                entry.saved,
+                entry.session.is_some(),
+                entry
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.is_connected()),
+            )
+        });
         div()
             .key_context("Connections")
             .flex()
@@ -371,6 +599,66 @@ impl Render for Connections {
                         .child(text),
                 )
             })
+            .when_some(
+                controls,
+                |view, (id, loading, saved, has_session, connected)| {
+                    let disconnect_id = id.clone();
+                    let reconnect_id = id.clone();
+                    view.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_2()
+                            .child(
+                                Button::new("reconnect-connection")
+                                    .small()
+                                    .label(if connected {
+                                        "Reconnect…"
+                                    } else if has_session {
+                                        "Reconnect"
+                                    } else {
+                                        "Connect"
+                                    })
+                                    .disabled(loading || !saved)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ManageConnection {
+                                            id: reconnect_id.clone(),
+                                            reconnect: true,
+                                        })
+                                    })),
+                            )
+                            .child(
+                                Button::new("refresh-connection-metadata")
+                                    .small()
+                                    .ghost()
+                                    .label("Refresh metadata")
+                                    .disabled(loading || !connected)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.refresh_metadata(&id, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("disconnect-connection")
+                                    .small()
+                                    .ghost()
+                                    .label(if connected {
+                                        "Disconnect…"
+                                    } else {
+                                        "Disconnect"
+                                    })
+                                    .disabled(loading || !has_session)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(ManageConnection {
+                                            id: disconnect_id.clone(),
+                                            reconnect: false,
+                                        })
+                                    })),
+                            ),
+                    )
+                },
+            )
     }
 }
 

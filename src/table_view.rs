@@ -5,6 +5,7 @@ use crate::{
         FilterOperator, PAGE_SIZE, TableFilter, TableQuery, TableRows, TableSchema,
         truncate_preview,
     },
+    workspace_state::TableDraft,
 };
 use gpui_kit::{
     component::{
@@ -193,11 +194,13 @@ pub(crate) struct TableView {
     title: String,
     location: String,
     request: Option<OpenTable>,
+    draft: Option<TableDraft>,
     table: Option<Entity<TableState<Rows>>>,
     fields: Vec<RowField>,
     selected_row: Option<usize>,
     load_generation: u64,
     loading_row: bool,
+    row_reads: usize,
     saving: bool,
     edit_error: Option<String>,
     error: Option<String>,
@@ -213,11 +216,14 @@ pub(crate) struct TableView {
     export_failed: bool,
 }
 
+pub(crate) struct QueryChanged;
+
+impl EventEmitter<QueryChanged> for TableView {}
 impl EventEmitter<TableEvent> for TableView {}
 
 impl TableView {
     pub(crate) fn can_change_schema(&self, cx: &App) -> bool {
-        !self.is_dirty(cx) && !self.saving && !self.loading && !self.loading_row && !self.exporting
+        !self.is_dirty(cx) && !self.is_busy()
     }
 
     pub(crate) fn begin_schema_change(&mut self, cx: &mut Context<Self>) {
@@ -253,16 +259,75 @@ impl TableView {
     }
 
     pub(crate) fn new(request: OpenTable, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let title = request.table.clone();
-        let location = format!("{} / {}", request.connection_name, request.database);
-        let mut view = Self {
-            title,
-            location,
-            request: Some(request),
-            ..Self::default()
-        };
-        view.load(TableQuery::default(), window, cx);
+        let mut view = Self::restore(TableDraft::new(&request));
+        view.request = Some(request);
+        view.load(view.query.clone(), window, cx);
         view
+    }
+
+    pub(crate) fn restore(draft: TableDraft) -> Self {
+        Self {
+            title: draft.table.clone(),
+            location: format!("{} / {}", draft.connection_name, draft.database),
+            query: draft.query.clone(),
+            draft: Some(draft),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn draft(&self) -> Option<TableDraft> {
+        self.draft.as_ref().map(|draft| TableDraft {
+            query: self.query.clone(),
+            ..draft.clone()
+        })
+    }
+
+    pub(crate) fn detach(&mut self, cx: &mut Context<Self>) {
+        self.request = None;
+        self.table = None;
+        self.fields.clear();
+        self.selected_row = None;
+        self.filter_task = None;
+        self.filter_pending = false;
+        self.filter_column = None;
+        self.filter_operator = None;
+        self.filter_value = None;
+        self.error = None;
+        cx.emit(TableEvent::ClearSelection);
+        cx.notify();
+    }
+
+    pub(crate) fn attach(
+        &mut self,
+        session: std::sync::Arc<crate::database::Session>,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = &mut self.draft else { return };
+        if self.request.is_some()
+            || session.connection_key() != draft.connection_key
+            || !session
+                .databases()
+                .get(&draft.database)
+                .is_some_and(|tables| tables.contains(&draft.table))
+        {
+            return;
+        }
+        draft.connection_name = name.clone();
+        self.location = format!("{} / {}", name, draft.database);
+        self.request = Some(OpenTable {
+            session,
+            connection_name: name,
+            database: draft.database.clone(),
+            table: draft.table.clone(),
+        });
+        self.load(self.query.clone(), window, cx);
+        cx.emit(QueryChanged);
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.loading || self.saving || self.row_reads > 0 || self.exporting
     }
 
     fn load(&mut self, query: TableQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -301,6 +366,7 @@ impl TableView {
                     Ok(data) => {
                         view.query = query;
                         view.finish(Ok(data), window, cx);
+                        cx.emit(QueryChanged);
                     }
                     Err(error) => {
                         view.error = Some(error);
@@ -451,13 +517,28 @@ impl TableView {
                     )
                     .detach();
                     self.filter_column = Some(column);
+                    let filter = self
+                        .query
+                        .filters
+                        .iter()
+                        .find(|filter| filter.column.is_none());
+                    let operator =
+                        filter.map_or(FilterOperator::Contains, |filter| filter.operator);
+                    let value = filter
+                        .map(|filter| filter.value.clone())
+                        .unwrap_or_default();
                     self.filter_operator = Some(cx.new(|cx| {
                         SelectState::new(
                             FilterOperator::ALL
                                 .iter()
                                 .map(|operator| operator.label().to_owned())
                                 .collect::<Vec<_>>(),
-                            Some(component::IndexPath::new(0)),
+                            Some(component::IndexPath::new(
+                                FilterOperator::ALL
+                                    .iter()
+                                    .position(|value| *value == operator)
+                                    .unwrap(),
+                            )),
                             window,
                             cx,
                         )
@@ -471,7 +552,10 @@ impl TableView {
                     )
                     .detach();
                     let input = cx.new(|cx| {
-                        InputState::new(window, cx).placeholder("Value; empty removes filter")
+                        let mut input =
+                            InputState::new(window, cx).placeholder("Value; empty removes filter");
+                        input.set_value(value, window, cx);
+                        input
                     });
                     cx.subscribe_in(&input, window, |view, _, event: &InputEvent, window, cx| {
                         match event {
@@ -651,6 +735,7 @@ impl TableView {
             return;
         }
         self.loading_row = true;
+        self.row_reads += 1;
         let load_schema = schema.clone();
         let task = cx.background_spawn(async move {
             async_std::task::block_on(request.session.read_row(
@@ -663,6 +748,8 @@ impl TableView {
         cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
+                view.row_reads -= 1;
+                cx.notify();
                 if view.load_generation != generation {
                     return;
                 }
@@ -733,8 +820,11 @@ impl TableView {
     }
 
     pub(crate) fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.is_dirty(cx) || self.saving {
-            self.edit_error = Some("Save or cancel your edits before closing this tab.".into());
+        if self.is_dirty(cx) || self.is_busy() {
+            self.edit_error = Some(
+                "Save or cancel your edits and wait for table operations before closing this tab."
+                    .into(),
+            );
             cx.notify();
             false
         } else {
@@ -928,7 +1018,13 @@ impl TableView {
                                 Button::new("save-row")
                                     .small()
                                     .label("Save")
-                                    .disabled(!dirty || self.saving)
+                                    .disabled(
+                                        !dirty
+                                            || self.saving
+                                            || self.request.as_ref().is_none_or(|request| {
+                                                !request.session.is_connected()
+                                            }),
+                                    )
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(Box::new(SaveRow), cx)
                                     }),
@@ -950,7 +1046,17 @@ impl TableView {
 
 impl Render for TableView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if let Some(error) = &self.error {
+        let status = if self.request.is_none() && self.draft.is_some() {
+            Some("Offline. Connect to the matching saved connection to restore this table’s filters, sorting, and page.".to_owned())
+        } else if let Some(error) = self
+            .request
+            .as_ref()
+            .and_then(|request| request.session.error())
+        {
+            Some(format!(
+                "{error}. Cancel row edits before reconnecting in the sidebar."
+            ))
+        } else if let Some(error) = &self.error {
             Some(error.clone())
         } else if self.table.is_none() {
             Some("Loading table…".to_owned())
@@ -1129,6 +1235,13 @@ impl Render for TableView {
                         .child(status),
                 )
             })
+            .when(self.table.is_none() && self.error.is_some() && self.request.is_some(), |view| {
+                view.child(div().flex().gap_2().px_3().py_2()
+                    .child(Button::new("retry-table").small().label("Retry").disabled(self.is_busy())
+                        .on_click(cx.listener(|view, _, window, cx| view.load(view.query.clone(), window, cx))))
+                    .child(Button::new("reset-table-query").small().outline().label("Reset filters and sorting").disabled(self.is_busy())
+                        .on_click(cx.listener(|view, _, window, cx| view.load(TableQuery::default(), window, cx)))))
+            })
             .when_some(self.export_status.as_ref(), |view, status| {
                 view.child(div().id("table-export-status").test_support().role(Role::Status)
                     .aria_label(status.clone()).px_3().py_2().text_sm()
@@ -1236,7 +1349,7 @@ mod tests {
     use crate::database::{TableRows, TableSchema};
     use gpui_kit::{
         App, AppContext, ElementId, Entity, Focusable, ScrollDelta, SharedString, TestAppContext,
-        component::{Root, Size},
+        component::{Root, Size, WindowExt},
         point, px, size,
         test::TestWindowExt,
     };
@@ -1248,6 +1361,867 @@ mod tests {
             .find(|field| field.name.as_ref() == name)
             .map(|field| ("input", field.input.entity_id()).into())
             .unwrap_or_else(|| SharedString::from(format!("row-field-{name}")).into())
+    }
+
+    #[gpui_kit::test]
+    fn mixed_workspace_restores_offline_and_close_protects_work(cx: &mut TestAppContext) {
+        use crate::{
+            database::{FilterOperator, TableFilter, TableQuery},
+            workspace_state::{SavedTab, SqlDraft, TableDraft, WorkspaceFile, WorkspaceState},
+        };
+        let directory =
+            std::env::temp_dir().join(format!("tablelane-table-recovery-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.json");
+        let draft = TableDraft {
+            connection_key: "offline-key".into(),
+            connection_name: "Local".into(),
+            database: "db".into(),
+            table: "widgets".into(),
+            query: TableQuery {
+                page: 2,
+                sort: Some(("name".into(), true)),
+                filters: vec![TableFilter {
+                    column: None,
+                    operator: FilterOperator::EndsWith,
+                    value: "世界".into(),
+                }],
+            },
+        };
+        let mut state = WorkspaceState::default();
+        state.tabs = vec![
+            SavedTab::Table(draft.clone()),
+            SavedTab::Sql(SqlDraft {
+                number: 5,
+                connection_key: draft.connection_key.clone(),
+                connection_name: draft.connection_name.clone(),
+                database: draft.database.clone(),
+                table: draft.table.clone(),
+                sql: "SELECT 'keep draft'".into(),
+            }),
+        ];
+        state.active = 0;
+        assert!(WorkspaceFile::load(Some(path.clone())).0.save(&state));
+        cx.update(gpui_kit::init);
+        let mut app = None;
+        let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                crate::AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let table = cx.update(|cx| {
+            let crate::WorkspaceTab::Table(table) = &app.read(cx).tabs[0] else {
+                panic!("Table missing")
+            };
+            assert_eq!(table.read(cx).draft(), Some(draft.clone()));
+            assert!(table.read(cx).request().is_none());
+            assert!(!table.read(cx).is_busy());
+            assert_eq!(app.read(cx).capture_workspace(cx), state);
+            table.clone()
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("table-status")
+                    .label()
+                    .unwrap()
+                    .starts_with("Offline.")
+            );
+            window.press("ctrl-tab", cx);
+            assert_eq!(app.read(cx).active_tab, 1);
+            window.press("ctrl-shift-tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(WorkspaceFile::load(Some(path.clone())).1, state);
+        // Every kind of table operation blocks both native close and tab close.
+        for operation in 0..4 {
+            cx.update(|cx| {
+                table.update(cx, |table, _| {
+                    table.loading = operation == 0;
+                    table.saving = operation == 1;
+                    table.exporting = operation == 2;
+                    table.row_reads = usize::from(operation == 3);
+                })
+            });
+            let mut visual = gpui_kit::VisualTestContext::from_window(handle.into(), cx);
+            assert!(!visual.simulate_close());
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.within("dialog").find("ok").label(), Some("OK"));
+                window.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.click(("close-tab", table.entity_id()), cx);
+                assert_eq!(app.read(cx).tabs.len(), 2);
+            })
+            .unwrap();
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            table.update(cx, |table, cx| {
+                table.loading = false;
+                table.saving = false;
+                table.exporting = false;
+                table.row_reads = 0;
+                table.set_fields(
+                    &TableSchema {
+                        columns: vec!["name".into()],
+                        column_types: vec!["text".into()],
+                        ..TableSchema::default()
+                    },
+                    vec![Some("original".into())],
+                    window,
+                    cx,
+                );
+                table.fields[0]
+                    .input
+                    .update(cx, |input, cx| input.set_value("unsaved", window, cx));
+            });
+            // Quit must inspect inactive tabs too.
+            app.update(cx, |app, cx| app.select_tab(1, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle.into(), cx);
+        assert!(!visual.simulate_close());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.within("dialog").find("ok").label(),
+                Some("Discard edits and close")
+            );
+            window.press("escape", cx);
+            assert!(table.read(cx).is_dirty(cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            // The app Quit route uses the same guard as native window close.
+            app.update(cx, |app, cx| assert!(!app.prepare_close(true, window, cx)));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let mut visual = gpui_kit::VisualTestContext::from_window(handle.into(), cx);
+        assert!(!visual.simulate_close());
+        cx.update_window(handle.into(), |_, window, cx| {
+            // Recheck operations at confirmation time as well.
+            table.update(cx, |table, _| table.loading = true);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            table.update(cx, |table, _| table.loading = false);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let saved = WorkspaceFile::load(Some(path.clone())).1;
+        assert_eq!(saved.tabs, state.tabs);
+        assert_eq!(saved.active, 1);
+        assert!(!std::fs::read_to_string(path).unwrap().contains("unsaved"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_connection_lifecycle_preserves_drafts_guards_work_and_refreshes_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{
+            database::{FilterOperator, TableFilter, TableQuery},
+            settings::{Connection, DatabaseKind, Settings},
+            workspace_state::{SavedTab, SqlDraft, TableDraft, WorkspaceFile, WorkspaceState},
+        };
+        use gpui_kit::{
+            AppContext,
+            component::Root,
+            test::{TestAppContextExt, TestWindowExt},
+        };
+        let config = Connection {
+            name: "Lifecycle".into(),
+            database_type: DatabaseKind::MariaDB,
+            host: "127.0.0.1".into(),
+            port: Some(
+                std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ),
+            username: "root".into(),
+            password: String::new(),
+            database: String::new(),
+            file_path: String::new(),
+        };
+        let admin = async_std::task::block_on(crate::database::connect(&config)).unwrap();
+        async_std::task::block_on(async {
+            admin
+                .run_sql("mysql", "CREATE DATABASE lifecycle_ui_test")
+                .await
+                .unwrap();
+            admin
+                .run_sql(
+                    "lifecycle_ui_test",
+                    "CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT)",
+                )
+                .await
+                .unwrap();
+            admin
+                .run_sql(
+                    "lifecycle_ui_test",
+                    "INSERT INTO widgets VALUES (1, 'row one'), (2, 'row two')",
+                )
+                .await
+                .unwrap();
+        });
+        let directory =
+            std::env::temp_dir().join(format!("tablelane-lifecycle-ui-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let draft = TableDraft {
+            connection_key: config.key(),
+            connection_name: config.name.clone(),
+            database: "lifecycle_ui_test".into(),
+            table: "widgets".into(),
+            query: TableQuery {
+                sort: Some(("id".into(), true)),
+                filters: vec![TableFilter {
+                    column: Some("name".into()),
+                    operator: FilterOperator::StartsWith,
+                    value: "row".into(),
+                }],
+                ..TableQuery::default()
+            },
+        };
+        let sql = "SELECT @lifecycle_runs := COALESCE(@lifecycle_runs, 0) + 1";
+        let mut state = WorkspaceState::default();
+        state.tabs = vec![
+            SavedTab::Table(draft.clone()),
+            SavedTab::Sql(SqlDraft {
+                connection_key: config.key(),
+                connection_name: config.name.clone(),
+                database: draft.database.clone(),
+                table: draft.table.clone(),
+                number: 1,
+                sql: sql.into(),
+            }),
+        ];
+        assert!(
+            WorkspaceFile::load(Some(directory.join("workspace.json")))
+                .0
+                .save(&state)
+        );
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::sql_editor::SqlEditor::isolate_test_history(cx);
+            cx.set_global(Settings {
+                connections: vec![config.clone()],
+                ..Settings::default()
+            });
+        });
+        let mut app = None;
+        let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                crate::AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let (table, editor) = cx.update(|cx| {
+            let crate::WorkspaceTab::Table(table) = &app.read(cx).tabs[0] else {
+                panic!("table")
+            };
+            let crate::WorkspaceTab::Sql(editor, _) = &app.read(cx).tabs[1] else {
+                panic!("editor")
+            };
+            (table.clone(), editor.clone())
+        });
+        let timeout = std::time::Duration::from_secs(15);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("connection-1", cx);
+            window.click("reconnect-connection", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            table.read(cx).table.is_some() && editor.read(cx).request().is_some()
+        })
+        .await;
+        let first = cx.update(|cx| table.read(cx).request().unwrap().session.clone());
+        assert_eq!(
+            async_std::task::block_on(first.run_sql("lifecycle_ui_test", "SELECT @lifecycle_runs"))
+                .unwrap()
+                .0
+                .rows[0][0],
+            None
+        );
+        // Refresh keeps the same SQL session and exposes newly created metadata.
+        async_std::task::block_on(admin.run_sql(
+            "lifecycle_ui_test",
+            "CREATE TABLE added (id INT PRIMARY KEY)",
+        ))
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("connection-1/database/lifecycle_ui_test", cx);
+            assert!(
+                window
+                    .try_find("connection-1/database/lifecycle_ui_test/table/added")
+                    .is_none()
+            );
+            window.click("refresh-connection-metadata", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !app.read(cx).connections.read(cx).is_connecting()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(
+                window
+                    .find("connection-1/database/lifecycle_ui_test/table/added")
+                    .visible()
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &first,
+                &editor.read(cx).request().unwrap().session
+            ));
+            app.update(cx, |view, cx| view.open_structure(window, cx));
+        })
+        .unwrap();
+        let structure = cx.update(|cx| {
+            let crate::WorkspaceTab::Structure(view) = &app.read(cx).tabs[2] else {
+                panic!("structure")
+            };
+            view.clone()
+        });
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !structure.read(cx).is_busy()
+        })
+        .await;
+        // All four table operation types protect even inactive tabs.
+        for operation in 0..4 {
+            cx.update_window(handle.into(), |_, window, cx| {
+                table.update(cx, |table, _| {
+                    table.loading = operation == 0;
+                    table.saving = operation == 1;
+                    table.row_reads = usize::from(operation == 2);
+                    table.exporting = operation == 3;
+                });
+                window.click("reconnect-connection", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                assert_eq!(window.within("dialog").find("ok").label(), Some("OK"));
+                assert!(first.is_connected());
+                window.press("escape", cx);
+                table.update(cx, |table, _| {
+                    table.loading = false;
+                    table.saving = false;
+                    table.row_reads = 0;
+                    table.exporting = false;
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            table.update(cx, |table, cx| {
+                let schema = table
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .schema
+                    .clone();
+                table.set_fields(
+                    &schema,
+                    vec![Some("1".into()), Some("row one".into())],
+                    window,
+                    cx,
+                );
+                table.fields[1]
+                    .input
+                    .update(cx, |input, cx| input.set_value("unsaved", window, cx));
+            });
+            window.click("disconnect-connection", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(window.within("dialog").find("ok").label(), Some("OK"));
+            assert!(table.read(cx).is_dirty(cx));
+            window.press("escape", cx);
+            table.update(cx, |table, _| table.fields.clear());
+            app.update(cx, |view, cx| view.select_tab(1, window, cx));
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).is_busy())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_ne!(window.find("export-sql-csv").disabled(), Some(true));
+            editor.update(cx, |editor, cx| {
+                editor.set_sql("SELECT SLEEP(0.3)".into(), window, cx)
+            });
+            window.click("run-sql", cx);
+            window.click("disconnect-connection", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(window.within("dialog").find("ok").label(), Some("OK"));
+            assert!(first.is_connected());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).is_busy())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_sql(sql.into(), window, cx));
+            window.click("disconnect-connection", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(
+                window.within("dialog").find("ok").label(),
+                Some("Disconnect")
+            );
+            window.press("escape", cx);
+            assert!(first.is_connected());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("disconnect-connection", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            // Confirmation cannot override work that started after it opened.
+            table.update(cx, |table, _| table.row_reads = 1);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            assert!(first.is_connected());
+            table.update(cx, |table, _| table.row_reads = 0);
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!first.is_connected());
+            assert!(table.read(cx).request().is_none());
+            assert!(editor.read(cx).request().is_none());
+            assert_eq!(table.read(cx).draft().unwrap().query, draft.query);
+            assert_eq!(editor.read(cx).draft(cx).sql, sql);
+            assert!(window.find("sql-offline").visible());
+            window.click("run-sql", cx);
+            assert!(!editor.read(cx).is_busy());
+            assert_ne!(window.find("export-sql-csv").disabled(), Some(true));
+            app.update(cx, |view, cx| view.select_tab(2, window, cx));
+            window.render_frame(cx);
+            window.click("refresh-structure", cx);
+            assert!(!structure.read(cx).is_busy());
+            window.click("reconnect-connection", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            table.read(cx).table.is_some()
+                && editor.read(cx).request().is_some()
+                && !structure.read(cx).is_busy()
+                && structure.read(cx).request().session.is_connected()
+        })
+        .await;
+        let second = cx.update(|cx| {
+            let second = editor.read(cx).request().unwrap().session.clone();
+            assert!(!std::sync::Arc::ptr_eq(&first, &second));
+            assert!(std::sync::Arc::ptr_eq(
+                &second,
+                &structure.read(cx).request().session
+            ));
+            assert_eq!(table.read(cx).query, draft.query);
+            assert_eq!(editor.read(cx).draft(cx).sql, sql);
+            second
+        });
+        assert_eq!(
+            async_std::task::block_on(
+                second.run_sql("lifecycle_ui_test", "SELECT @lifecycle_runs")
+            )
+            .unwrap()
+            .0
+            .rows[0][0],
+            None
+        );
+        // Editing credentials retains a separately controllable previous session.
+        cx.update(|cx| {
+            let mut settings = cx.global::<Settings>().clone();
+            settings.connections[0].name = "Renamed".into();
+            cx.set_global(settings);
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("connection-1", cx);
+            assert_eq!(
+                app.read(cx).connections.read(cx).selected_connection(cx),
+                None
+            );
+            window.click("reconnect-connection", cx);
+            assert!(!app.read(cx).connections.read(cx).is_connecting());
+            assert!(second.is_connected());
+            assert_ne!(window.find("disconnect-connection").disabled(), Some(true));
+            window.click("connection-2", cx);
+            window.click("reconnect-connection", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !app.read(cx).connections.read(cx).is_connecting()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("connection-1", cx);
+            window.click("disconnect-connection", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.within("dialog").click("ok", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.try_find("connection-1").is_none());
+            assert!(editor.read(cx).request().is_none());
+            // Explicitly connecting another session never immediately undoes Disconnect.
+            assert!(table.read(cx).request().is_none());
+            window.click("connection-2", cx);
+            window.click("refresh-connection-metadata", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            editor.read(cx).request().is_some() && table.read(cx).table.is_some()
+        })
+        .await;
+        cx.update(|cx| {
+            assert_eq!(editor.read(cx).connection_name(), "Renamed");
+        });
+        let third = cx.update(|cx| editor.read(cx).request().unwrap().session.clone());
+        let (rows, _) =
+            async_std::task::block_on(third.run_sql("mysql", "SELECT CONNECTION_ID()")).unwrap();
+        async_std::task::block_on(admin.run_sql(
+            "mysql",
+            &format!("KILL CONNECTION {}", rows.rows[0][0].as_ref().unwrap()),
+        ))
+        .unwrap();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(30));
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            editor.read(cx).request().is_none()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("connection-2-connected").is_none());
+            assert!(
+                window
+                    .find("connection-status")
+                    .label()
+                    .unwrap()
+                    .contains("Connection lost")
+            );
+            window.click("refresh-connection-metadata", cx);
+            assert!(!app.read(cx).connections.read(cx).is_connecting());
+            window.double_click("connection-2", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            editor.read(cx).request().is_some() && table.read(cx).table.is_some()
+        })
+        .await;
+        assert!(cx.update(|cx| editor.read(cx).request().unwrap().session.is_connected()));
+        async_std::task::block_on(admin.run_sql("mysql", "DROP DATABASE lifecycle_ui_test"))
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_table_workspace_reattaches_filters_sort_page_and_recovers_stale_columns(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{
+            database::{FilterOperator, TableFilter, TableQuery},
+            settings::{Connection, DatabaseKind, Settings},
+            workspace_state::{SavedTab, TableDraft, WorkspaceFile, WorkspaceState},
+        };
+        use gpui_kit::test::TestAppContextExt;
+        use sqlx::Connection as _;
+        let port = std::env::var("TABLELANE_TEST_MARIADB_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let config = Connection {
+            name: "Renamed".into(),
+            database_type: DatabaseKind::MariaDB,
+            host: "127.0.0.1".into(),
+            port: Some(port),
+            username: "root".into(),
+            password: String::new(),
+            database: String::new(),
+            file_path: String::new(),
+        };
+        let mut database = async_std::task::block_on(async {
+            let mut database =
+                sqlx::MySqlConnection::connect(&format!("mysql://root@127.0.0.1:{port}"))
+                    .await
+                    .unwrap();
+            sqlx::query("CREATE DATABASE recovery_test")
+                .execute(&mut database)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE recovery_test.widgets (id INT PRIMARY KEY, name TEXT)")
+                .execute(&mut database)
+                .await
+                .unwrap();
+            let values = (1..=1005)
+                .map(|id| format!("({id}, 'row {id}')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            sqlx::query(&format!(
+                "INSERT INTO recovery_test.widgets VALUES {values}"
+            ))
+            .execute(&mut database)
+            .await
+            .unwrap();
+            database
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "tablelane-table-recovery-live-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.json");
+        let draft = TableDraft {
+            connection_key: config.key(),
+            connection_name: "Old name".into(),
+            database: "recovery_test".into(),
+            table: "widgets".into(),
+            query: TableQuery {
+                page: 1,
+                sort: Some(("id".into(), true)),
+                filters: vec![
+                    TableFilter {
+                        column: None,
+                        operator: FilterOperator::StartsWith,
+                        value: "row".into(),
+                    },
+                    TableFilter {
+                        column: Some("id".into()),
+                        operator: FilterOperator::GreaterThan,
+                        value: "1".into(),
+                    },
+                ],
+            },
+        };
+        let mut stale = draft.clone();
+        stale.query.filters[1].column = Some("removed_column".into());
+        let mut unavailable = draft.clone();
+        unavailable.table = "missing_table".into();
+        let mut wrong = draft.clone();
+        let mut other_config = config.clone();
+        other_config.username = "other-user".into();
+        wrong.connection_key = other_config.key();
+        let mut state = WorkspaceState::default();
+        state.tabs = vec![
+            SavedTab::Table(draft.clone()),
+            SavedTab::Table(stale.clone()),
+            SavedTab::Table(unavailable),
+            SavedTab::Table(wrong),
+        ];
+        assert!(WorkspaceFile::load(Some(path.clone())).0.save(&state));
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(Settings {
+                connections: vec![config],
+                ..Settings::default()
+            });
+        });
+        let mut app = None;
+        let handle = cx.open_window(size(px(1100.), px(700.)), |window, cx| {
+            let view = cx.new(|cx| {
+                crate::AppView::new(
+                    Some(directory.join("settings.json")),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let tables = cx.update(|cx| {
+            app.read(cx)
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let crate::WorkspaceTab::Table(table) = tab else {
+                        panic!("Table missing")
+                    };
+                    assert!(table.read(cx).request().is_none());
+                    table.clone()
+                })
+                .collect::<Vec<_>>()
+        });
+        let timeout = std::time::Duration::from_secs(15);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.double_click("connection-1", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            tables[0].read(cx).table.is_some() && tables[1].read(cx).error.is_some()
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let table = tables[0].read(cx);
+            assert_eq!(table.query, draft.query);
+            assert_eq!(table.title(), "Renamed / recovery_test / widgets");
+            let rows = &table.table.as_ref().unwrap().read(cx).delegate().data.rows;
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows[0][0].as_deref(), Some("5"));
+            assert_eq!(rows[3][0].as_deref(), Some("2"));
+            assert_eq!(window.find("filter-value").value(), Some("row"));
+            assert_eq!(window.find("filter-operator").value(), Some("Starts with"));
+            assert_eq!(
+                window.find("page-status").label(),
+                Some("Page 2 · Rows 1001–1004")
+            );
+            assert!(tables[2].read(cx).request().is_none());
+            assert!(tables[3].read(cx).request().is_none());
+            let request = table.request().unwrap().clone();
+            app.update(cx, |app, cx| app.open_table(&request, window, cx));
+            assert_eq!(app.read(cx).tabs.len(), 4);
+            assert_eq!(app.read(cx).active_tab, 0);
+            window.click("previous-page", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !tables[0].read(cx).loading && tables[0].read(cx).query.page == 0
+        })
+        .await;
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        let SavedTab::Table(saved) = &WorkspaceFile::load(Some(path.clone())).1.tabs[0] else {
+            panic!("Saved table missing")
+        };
+        assert_eq!(saved.query.page, 0);
+        assert_eq!(saved.query.filters, draft.query.filters);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.within("workspace-tabs").click(1_usize, cx);
+            window.render_frame(cx);
+            assert_eq!(tables[1].read(cx).query, stale.query);
+            assert!(
+                window
+                    .find("table-status")
+                    .label()
+                    .unwrap()
+                    .contains("Filter column is unavailable")
+            );
+            window.click("reset-table-query", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            tables[1].read(cx).table.is_some() && !tables[1].read(cx).loading
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(tables[1].read(cx).query, TableQuery::default());
+            assert_eq!(
+                tables[1]
+                    .read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows
+                    .len(),
+                1000
+            );
+            // Successful filter changes autosave the applied query.
+            window.within("workspace-tabs").click(0_usize, cx);
+            window.click("filter-value", cx);
+            window.press("secondary-a", cx);
+            window.input("missing row", cx);
+            window.click("apply-filter", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| {
+            !tables[0].read(cx).loading
+                && tables[0].read(cx).query.filters[1].value == "missing row"
+        })
+        .await;
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let saved = WorkspaceFile::load(Some(path.clone())).1;
+            assert_eq!(saved, app.read(cx).capture_workspace(cx));
+            assert_eq!(tables[0].read(cx).query.page, 0);
+            assert!(
+                tables[0]
+                    .read(cx)
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows
+                    .is_empty()
+            );
+        });
+        async_std::task::block_on(
+            sqlx::query("DROP DATABASE recovery_test").execute(&mut database),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[gpui_kit::test]

@@ -100,6 +100,31 @@ impl SchemaView {
     pub(crate) fn request(&self) -> &OpenTable {
         &self.request
     }
+
+    pub(crate) fn attach(
+        &mut self,
+        session: std::sync::Arc<crate::database::Session>,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.request.session.is_connected()
+            || self.is_busy()
+            || !session
+                .databases()
+                .get(&self.request.database)
+                .is_some_and(|tables| tables.contains(&self.request.table))
+        {
+            return;
+        }
+        self.request.session = session;
+        self.request.connection_name = name;
+        self.refresh(window, cx);
+    }
+    pub(crate) fn is_busy(&self) -> bool {
+        self.loading || self.running
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.running
     }
@@ -107,7 +132,7 @@ impl SchemaView {
         self.focus.focus(window, cx);
     }
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.loading || self.running {
+        if self.loading || self.running || !self.request.session.is_connected() {
             return;
         }
         self.loading = true;
@@ -174,7 +199,12 @@ impl SchemaView {
             .and_then(|ix| table.delegate().data.rows.get(ix))
     }
     fn open_change(&mut self, kind: ChangeKind, window: &mut Window, cx: &mut Context<Self>) {
-        if self.loading || self.running || self.tables.is_empty() || window.has_active_dialog(cx) {
+        if self.loading
+            || self.running
+            || !self.request.session.is_connected()
+            || self.tables.is_empty()
+            || window.has_active_dialog(cx)
+        {
             return;
         }
         let row = self.selected(cx);
@@ -326,7 +356,7 @@ impl SchemaView {
 }
 impl Render for SchemaView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let busy = self.loading || self.running;
+        let busy = self.loading || self.running || !self.request.session.is_connected();
         let selected = self.selected(cx).is_some();
         div().size_full().flex().flex_col().min_w_0().min_h_0().track_focus(&self.focus)
             .child(div().px_3().py_2().text_lg().font_weight(FontWeight::SEMIBOLD)
@@ -346,8 +376,8 @@ impl Render for SchemaView {
                     cx.emit(SchemaEvent::EditSql(format!("-- Enter one schema change, then Run. DDL cannot be rolled back.\nALTER TABLE {}.{}\n    ", quote_identifier(&view.request.database), quote_identifier(&view.request.table))));
                 })))
                 .child(Button::new("refresh-structure").small().ghost().label("Refresh").disabled(busy).on_click(cx.listener(|view, _, window, cx| view.refresh(window, cx)))))
-            .child(div().id("structure-status").test_support().role(Role::Status).aria_label(self.status.clone()).px_3().pb_2().text_sm()
-                .text_color(if self.failed { cx.theme().danger } else { cx.theme().muted_foreground }).child(self.status.clone()))
+            .child(div().id("structure-status").test_support().role(Role::Status).aria_label(if self.request.session.is_connected() { self.status.clone() } else { "Offline. Reconnect in the sidebar to change structure.".into() }).px_3().pb_2().text_sm()
+                .text_color(if self.failed { cx.theme().danger } else { cx.theme().muted_foreground }).child(if self.request.session.is_connected() { self.status.clone() } else { "Offline. Reconnect in the sidebar to change structure.".into() }))
             .child(div().flex_1().min_h_0().min_w_0()
                 .when(self.section == 3, |body| body.child(Editor::new(&self.ddl).aria_label("CREATE statement").readonly(true).size_full()))
                 .when_some(self.tables.get(self.section), |body, table| body.child(DataTable::new(table).small().stripe(true).bordered(false))))

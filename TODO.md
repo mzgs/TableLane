@@ -11,10 +11,10 @@ protection against unsaved edits and concurrent database changes.
 
 ## Checklist
 
-- [ ] Connection management
+- [x] Connection management
   - [x] Edit and delete saved connections
   - [x] Test connection before saving
-  - [ ] Disconnect/reconnect, metadata refresh, accurate connection health
+  - [x] Disconnect/reconnect, metadata refresh, accurate connection health
 - [ ] Data transfer
   - [x] CSV/JSON export of full table/query values (never truncated previews)
   - [ ] CSV import with column mapping, validation, and transaction rollback
@@ -22,10 +22,10 @@ protection against unsaved edits and concurrent database changes.
   - [ ] Insert, duplicate, delete with appropriate confirmation
   - [ ] Bulk actions with stable row identity
   - [x] Explicit NULL control, distinct from empty strings
-- [ ] Workspace recovery
+- [x] Workspace recovery
   - [x] Persist and restore SQL drafts and tabs
-  - [ ] Persist table filters, sorting, and pagination
-  - [ ] Protect unsaved work when quitting
+  - [x] Persist table filters, sorting, and pagination
+  - [x] Protect unsaved work when quitting
 - [ ] Query cancellation without leaving a busy/broken shared session
 - [ ] SQL workflow
   - [x] Run selected SQL
@@ -140,31 +140,115 @@ protection against unsaved edits and concurrent database changes.
   restoration and full quit protection remain on the roadmap.
 - No dependencies added, no credential-storage changes, no commit created.
 
+### 2026-10-12 — Table recovery and quit protection
+
+- Extended the existing workspace file to preserve SQL/table tab order and the
+  selected recoverable tab, with applied table filters, sorting, and page.
+  Existing SQL-only files remain readable; invalid files and failed writes keep
+  the same preservation and retry behavior. Row drafts and results are excluded.
+- Table tabs restore offline without connecting. Connecting a matching saved
+  endpoint reloads accessible tables with their saved query; renamed connections
+  update labels. Missing tables and unmatched connections remain offline.
+  Removed filter/sort columns surface errors with Retry and Reset controls.
+- Applied query changes autosave after 300 ms; opening, switching, closing, and
+  quitting reuse the existing recovery lifecycle. Structure tabs remain excluded;
+  if a Structure tab was selected, recovery selects the first saved tab.
+- Quit and native window close inspect every tab, including inactive tabs. They
+  block while connections, reads, row saves, schema changes, or exports run, and
+  ask before discarding row edits or losing unsaved recovery data. Cancel keeps
+  edits; confirming discard never writes the row draft to the database.
+- Tab close now also waits for table/structure reads and exports. Outstanding
+  row reads remain tracked even after selection changes invalidate their result.
+- Verification:
+  - `cargo test --locked -- --test-threads=1`: 30 passed; 14 live tests ignored.
+    Added mixed offline recovery/native-close checks and legacy-file validation.
+  - Isolated MariaDB: all 13 `mariadb_` tests passed, including new 1,005-row
+    recovery coverage for restored filters, descending sort, page, renamed and
+    unavailable connections/tables, stale columns, reset, and query autosave.
+    Existing SQL tests also verified quit protection during an inactive query.
+  - Debug-startup integration test passed with the isolated `apps.apps` fixture.
+  - `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`,
+    and `git diff --check`: passed.
+  - Temporary server shut down after testing; saved user connections and
+    production SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review. Crash/OS forced
+  termination can still lose recent drafts or interrupt database work, and
+  running work has no cancellation yet. Restored pages use current database data.
+- No dependencies added, no credential-storage changes, no commit created.
+
+### 2026-10-12 — Connection lifecycle and health
+
+- Added selected-connection Connect, Disconnect…, Reconnect…, and Refresh metadata
+  controls, available when a connection or any database/table child is selected.
+  Removed children fall back to their connection root so recovery controls stay
+  accessible. Metadata refresh preserves existing database expansion state.
+- Disconnect/reconnect checks all tabs using that exact session, including
+  inactive tabs, and blocks on row edits, reads, saves, queries, schema work, and
+  exports. Confirmation explains rollback of uncommitted SQL transactions and
+  loss of temporary tables/session variables. Cancel and stale confirmations
+  leave sessions alone; guards are rechecked before closing the socket.
+- SQL drafts and completed SQL export snapshots survive offline transitions.
+  Table queries retain their applied filters, sorting, and page. Reconnection
+  uses a new session, reloads available tables and Structure tabs, and never
+  runs SQL drafts. Missing objects remain offline. Unexpected connection loss
+  preserves dirty row drafts until the user cancels them before reconnecting.
+- Edited/deleted saved connections retain their live sessions as “Previous
+  session” sidebar entries. These can still browse, refresh metadata, or
+  disconnect, but cannot reconnect using removed settings. Explicit disconnect
+  does not immediately reattach tabs to another already-open matching session.
+- Metadata refresh updates the tree and completions in existing SQL editors on
+  the same session; failed refreshes preserve the previous metadata snapshot.
+  Table and Structure previews keep their own Refresh commands.
+- Idle sessions receive background pings about every 30 seconds, with a
+  five-second timeout. Checks skip busy sessions and never cancel user queries.
+  Failed checks and operation transport errors remove the connected indicator,
+  disable unavailable commands, and require explicit reconnect.
+- Verification:
+  - `cargo test --locked -- --test-threads=1`: 30 passed; 16 live tests ignored.
+  - Isolated MariaDB: all 15 `mariadb_` tests passed. New database/UI coverage
+    includes metadata/completion refresh, unchanged SQL session variables,
+    inactive-tab guards, confirmation cancellation/rechecks, offline draft and
+    export retention, table/Structure reattachment, retained previous sessions,
+    killed-server-session health detection, and double-click reconnect. A final
+    targeted database run also verified uncommitted SQL rollback on disconnect
+    and immediate health invalidation after an operation transport error.
+  - Debug-startup integration test passed using isolated `apps.apps` fixtures.
+  - `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`,
+    and `git diff --check`: passed.
+  - One earlier live run timed out in an existing schema UI check; the final
+    complete serial live run passed. New cross-view tests isolate SQL history.
+  - Temporary servers shut down; saved user settings and SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review. Health polling has a
+  delay and skips long-running operations; there is no automatic reconnect or
+  query cancellation. Reconnect drops database session state after confirmation.
+- No dependencies added, no credential-storage changes, no commit created.
+
 ## Continuation notes
 
-- Next batch: table workspace state and full quit protection for row edits and
-  running database operations. Keep every incomplete checkbox above visible until
-  verified.
+- Next batch: CSV import with column mapping, validation, and transaction
+  rollback. Keep every incomplete checkbox above visible until verified.
 - The full roadmap is not complete.
 - Edited connections apply to future sessions; existing tabs retain their old
-  session and label. Deletion similarly keeps existing tabs usable. Any future
-  disconnect/reconnect workflow must handle these retained sessions explicitly.
+  session and label. Retained sessions remain controllable through “Previous
+  session” sidebar entries, including after deletion of their saved settings.
 - Regression checks are in `src/connection_dialog.rs`, `src/table_view.rs`, and
   `src/sql_editor.rs`. Live tests require an isolated MariaDB instance; use the
   fixture and invocation documented in README (serial execution avoids shared
   fixture interference).
 - Credentials live in `src/settings.rs` and `src/settings/password.rs`.
-- Connections are retained in `src/connections.rs`; open tabs hold session Arcs.
-  Disconnect/reconnect must account for these tabs and unsaved/running work.
+- Connections and retained sessions live in `src/connections.rs`; open tabs hold
+  session Arcs. The app shell guards lifecycle commands across every affected
+  tab. Keep these guards when adding import or row operations.
 - `src/database.rs` shares one mutex-protected MySQL connection per session.
   Cancellation must stop the server query, not only abandon the UI task.
 - Table previews and SQL results truncate values. Table export fetches full values
   in one streaming SELECT; SQL export reads the private temporary snapshot from
   the completed execution and must never rerun the statement.
-- SQL recovery lives in `src/workspace_state.rs`; the app shell owns autosave and
-  restoration, SQL editors hold offline drafts, and connected sessions retain a
-  credential-free connection identity. Preserve offline text when extending table
-  recovery or disconnect/reconnect.
+- SQL/table recovery lives in `src/workspace_state.rs`; the app shell owns
+  autosave, restoration, and quit guards. SQL editors hold offline text and table
+  views hold offline queries; sessions retain a credential-free identity. Preserve
+  both when adding new operations, and include their running work in lifecycle
+  and quit guards.
 - README documents the current behavior and test-server setup.
 - Run `cargo fmt --check`, `cargo test --locked`, and Clippy after each batch.
   Live MariaDB tests are ignored unless an isolated test server is configured.
