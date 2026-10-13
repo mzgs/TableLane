@@ -15,11 +15,11 @@ protection against unsaved edits and concurrent database changes.
   - [x] Edit and delete saved connections
   - [x] Test connection before saving
   - [x] Disconnect/reconnect, metadata refresh, accurate connection health
-- [ ] Data transfer
+- [x] Data transfer
   - [x] CSV/JSON export of full table/query values (never truncated previews)
-  - [ ] CSV import with column mapping, validation, and transaction rollback
+  - [x] CSV import with column mapping, validation, and transaction rollback
 - [ ] Row operations
-  - [ ] Insert, duplicate, delete with appropriate confirmation
+  - [x] Insert, duplicate, delete with appropriate confirmation
   - [ ] Bulk actions with stable row identity
   - [x] Explicit NULL control, distinct from empty strings
 - [x] Workspace recovery
@@ -223,22 +223,163 @@ protection against unsaved edits and concurrent database changes.
   query cancellation. Reconnect drops database session state after confirmation.
 - No dependencies added, no credential-storage changes, no commit created.
 
+### 2026-10-12 — CSV import
+
+- Added Import CSV… to table controls, using a native file picker and a mapping
+  form with automatic header matches, skip/remap controls, and first-value
+  previews. Cancel leaves the database untouched; failed submissions retain
+  their mapping. Successful imports add rows, retain applied filters/sorting,
+  and return browsing to the first page.
+- UTF-8 parsing preserves quoted commas/newlines, doubled quotes, NULL versus
+  empty text, and full values. Validation rejects malformed records, duplicate
+  headers/targets, unsupported/generated columns, and invalid binary hex.
+  Initial limits were 16 MiB, 100,000 data rows, 256 columns, and 1,000,000
+  cells; the streaming batch below replaces these limits.
+- Inserts use bound parameters in one transaction, with rollback on constraints
+  or conversion warnings. A metadata lock prevents schema changes during import;
+  stale column metadata is rejected. Existing SQL transactions and disabled
+  autocommit are refused without committing the user's work.
+- Rollback protection requires InnoDB and no triggers. A direct global,
+  database, or table TRIGGER privilege is required to verify trigger visibility;
+  role-only grants are not accepted. Rollback can leave auto-increment gaps;
+  uncertain commit/rollback errors ask users to check the table before retrying.
+- Imports participate in schema, tab-close, native-close, quit, and connection
+  lifecycle guards, including inactive tabs. Busy form actions reject repeated
+  submissions, Cancel, and Escape. README documents the format and limitations.
+- Verification:
+  - Full serial suite on temporary isolated MariaDB:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --test-threads=1`:
+    49 passed, including all 17 MariaDB tests and debug startup.
+  - New database coverage includes full Unicode/binary/NULL/empty/default values,
+    duplicate keys, lossy conversions, missing required values, transaction
+    preservation, engines/triggers/privileges, stale schema, and 1,005-row imports.
+  - New UI coverage includes picker cancellation, malformed files, keyboard
+    mapping, duplicate mapping, failed-submit retry, busy actions, retained
+    filters/sorting, page reset, and idle-form Escape cancellation. Existing
+    lifecycle/quit checks now include import work.
+  - `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`,
+    and `git diff --check`: passed.
+  - Temporary server shut down; saved user settings and SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review. The installed Kit
+  does not expose disabled-button metadata in headless snapshots; busy tests
+  verify actual blocked clicks and keyboard behavior. Import has no cancellation
+  once database work starts; role-only privilege support remains unimplemented.
+  The initial large-file limitation is resolved in the streaming batch below.
+- No dependencies added, no credential-storage changes, no commit created.
+
+### 2026-10-12 — Streaming large CSV imports
+
+- Replaced whole-file loading with a 64 KiB buffered record parser. Total file,
+  row, column, and cell caps are removed. The mapping screen reads only the
+  header and first record, retaining short value previews; it does not scan or
+  copy a 16 GB file before showing the form.
+- Full UTF-8, quoting, width, and binary validation runs as records stream.
+  Single records must fit the connection's max_allowed_packet setting, which
+  bounds record memory and reflects the database's individual-statement limit.
+  Oversized-record errors name the record and explain increasing the setting
+  and reconnecting. File offsets, progress, and row totals use 64-bit counts.
+- Sends parameterized multi-row INSERTs in batches of up to 1,000 rows and
+  roughly 1 MiB, reduced for packet/bind limits. Skipped values are dropped before
+  batching. Large individual records use their own batch. Statement caching is
+  disabled for variable batch shapes to keep prepared-statement memory bounded.
+- One transaction still covers the entire import: late parse, conversion,
+  constraint, and file-read failures roll back previously inserted batches.
+  Warning counts are checked even when the server suppresses warning details.
+  Existing schema, transaction, engine, trigger, and lifecycle guards remain.
+- Source identity, size, modification time, and headers are verified; detected
+  changes during import trigger rollback. The source must remain unchanged,
+  since it is read directly rather than captured as an immutable disk snapshot.
+  The form refreshes processed-row and byte progress every 250 ms.
+- Reused memchr, already present in Cargo.lock, as a direct dependency for fast
+  byte delimiter searches. No new dependency version/package was resolved.
+- Verification:
+  - Generated 16 GiB streaming parser test passed: 262,144 records, with
+    8,699,904-byte (8.3 MiB) maximum test-process RSS measured by /usr/bin/time -l.
+    This checks the real parser through a generated Read stream without writing
+    16 GiB to the user's disk; it is not a full 16 GB database-load benchmark.
+  - Isolated MariaDB imported 100,003 rows from a >16 MiB, >1,000,000-cell file
+    using 101 INSERTs, preserving full Unicode/binary values and progress totals.
+    Late malformed CSV, invalid hex, duplicate keys, conversion/NULL/width errors,
+    and concurrent source changes rolled back earlier successful batches.
+  - Final serial regression command:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --skip csv_streaming_16_gib --test-threads=1`:
+    51 passed; the 16 GiB stress check passed separately (52 total tests).
+  - One earlier serial run failed an unchanged connection-dialog UI test; it
+    passed alone and in the final full serial run. Root cause remains undiagnosed.
+  - Clippy with -D warnings, formatting, and git diff checks passed.
+  - Temporary server shut down; saved settings and SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review and a full 16 GB
+  end-to-end database load. Large single transactions require database disk/log
+  space, hold locks until commit, and can take time to roll back. Cancellation
+  and role-only trigger privilege support remain unimplemented.
+- README updated; no credential-storage changes or commit created.
+
+### 2026-10-12 — Insert, duplicate, and delete rows
+
+- Added Insert row… below tables and Duplicate… / Delete… in row details,
+  reusing the existing row editor and Kit controls. New drafts offer database
+  defaults separately from explicit NULL and empty text; Insert / Cmd+S commits,
+  Cancel / Escape discards. Opening a new draft focuses the row editor so
+  keyboard cancellation works before editing a text field.
+- Duplicate copies full loaded values, defaults auto-increment/generated fields,
+  and lets users change other primary/unique keys before inserting. It requires
+  a primary key and refuses unsupported nongenerated columns rather than losing
+  copied values. Insert also supports tables without primary keys.
+- Delete names the selected primary key in a danger confirmation and explains
+  permanent deletion and foreign-key cascades. It uses the full original row
+  and primary key, including composite/binary keys, to reject concurrent changes.
+  Confirmation rechecks busy state, draft state, session, and selection generation.
+- Insert/delete share CSV import's metadata-lock, schema, InnoDB, no-trigger,
+  and direct-TRIGGER-privilege validation. Existing SQL transactions or disabled
+  autocommit are refused without committing user work. Bound parameters preserve
+  values; constraints and conversion warnings roll back, even when the server
+  suppresses warning details. Uncertain commit/rollback errors require checking
+  the table before retrying; rollback can leave auto-increment gaps.
+- New drafts and running writes reuse dirty/busy lifecycle guards across all
+  tabs. Failed inserts retain their draft; successful insert/delete reloads the
+  first page with applied filters and sorting. Filtered-out new rows may stay
+  invisible. No database writes occur when opening or cancelling a draft.
+- Verification:
+  - Final isolated MariaDB serial regression:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --skip csv_streaming_16_gib --test-threads=1`:
+    53 passed, including all live MariaDB checks and debug startup.
+  - New database coverage includes defaults, generated/auto-increment fields,
+    full Unicode/binary/NULL/empty copies, duplicate/required values, lossy
+    conversion rollback, transaction preservation, stale schema, engines,
+    trigger visibility, concurrent changes, composite keys, and cascading delete.
+  - Production UI coverage includes new-draft focus/cancel, disabled repeated
+    insert, full-value copy, failed-insert retry, Cmd+S, delete cancellation,
+    concurrent-change rejection after opening confirmation, and busy rechecks.
+    Dialog confirmation tests process deferred actions before changing state and
+    use keyboard activation to avoid sampling a moving animated button.
+  - An earlier full run hit the previously documented unchanged connection-dialog
+    assertion; the final full run passed. Its intermittent failure remains
+    undiagnosed. The unchanged 16 GiB parser stress check was not repeated.
+  - Clippy with -D warnings, formatting, and diff checks passed.
+  - Temporary server shut down; saved user settings and SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review. Bulk row actions,
+  cancellation, and role-only trigger privileges remain unimplemented.
+- README updated; no dependencies, credential-storage changes, or commit added.
+
 ## Continuation notes
 
-- Next batch: CSV import with column mapping, validation, and transaction
-  rollback. Keep every incomplete checkbox above visible until verified.
+- Next batch: bulk row actions with stable primary-key identity and confirmation,
+  then query cancellation. Keep every incomplete checkbox visible until verified.
 - The full roadmap is not complete.
 - Edited connections apply to future sessions; existing tabs retain their old
   session and label. Retained sessions remain controllable through “Previous
   session” sidebar entries, including after deletion of their saved settings.
 - Regression checks are in `src/connection_dialog.rs`, `src/table_view.rs`, and
-  `src/sql_editor.rs`. Live tests require an isolated MariaDB instance; use the
+  `src/sql_editor.rs`; CSV checks also live in `src/data_import.rs` and
+  `src/table_view/import.rs`. Row-operation checks live in
+  `src/database/row_operations.rs` and `src/table_view/row_operations.rs`.
+  Live tests require an isolated MariaDB instance; use the
   fixture and invocation documented in README (serial execution avoids shared
   fixture interference).
 - Credentials live in `src/settings.rs` and `src/settings/password.rs`.
 - Connections and retained sessions live in `src/connections.rs`; open tabs hold
   session Arcs. The app shell guards lifecycle commands across every affected
-  tab. Keep these guards when adding import or row operations.
+  tab. Keep these guards when adding row operations.
 - `src/database.rs` shares one mutex-protected MySQL connection per session.
   Cancellation must stop the server query, not only abandon the UI task.
 - Table previews and SQL results truncate values. Table export fetches full values

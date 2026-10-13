@@ -1,6 +1,7 @@
 mod connection_dialog;
 mod connections;
 mod data_export;
+mod data_import;
 mod database;
 mod schema_view;
 mod settings;
@@ -468,7 +469,7 @@ impl AppView {
         if self.has_running_work(cx) {
             window.open_alert_dialog(cx, |dialog, _, _| {
                 dialog.title("Wait for running operations")
-                    .description("A connection, query, row save, schema change, or export is still running. Wait for it to finish, then close again.")
+                    .description("A connection, query, row save, schema change, import, or export is still running. Wait for it to finish, then close again.")
             });
             return false;
         }
@@ -574,6 +575,16 @@ impl AppView {
             }
             cx.notify();
         })
+        .detach();
+        cx.subscribe(
+            &table,
+            |view, table, _: &table_view::RowEditorOpened, cx| {
+                if view.table().is_some_and(|active| active == &table) {
+                    view.right_sidebar_visible = true;
+                }
+                cx.notify();
+            },
+        )
         .detach();
         self.tabs.push(WorkspaceTab::Table(table));
         self.select_tab(self.tabs.len() - 1, window, cx);

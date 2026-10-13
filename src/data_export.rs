@@ -21,10 +21,10 @@ impl ExportFormat {
     }
 }
 
-struct TemporaryFile(PathBuf);
+pub(crate) struct TemporaryFile(PathBuf);
 
 impl TemporaryFile {
-    fn new(directory: &Path) -> Result<(Self, File)> {
+    pub(crate) fn new(directory: &Path) -> Result<(Self, File)> {
         let mut nonce = [0; 16];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -43,6 +43,11 @@ impl TemporaryFile {
         }
         let file = options.open(&path)?;
         Ok((Self(path), file))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
 }
 

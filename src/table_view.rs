@@ -1,3 +1,6 @@
+mod import;
+mod row_operations;
+
 use crate::{
     connections::OpenTable,
     data_export::ExportFormat,
@@ -80,7 +83,7 @@ impl TableDelegate for Rows {
                     ", ascending"
                 })
             ))
-            .disabled(view.loading || view.saving || view.is_dirty(cx))
+            .disabled(view.loading || view.saving || view.importing || view.is_dirty(cx))
             .on_click(move |_, window, cx| {
                 owner.update(cx, |view, cx| {
                     let mut query = view.query.clone();
@@ -173,6 +176,7 @@ struct RowField {
     input: Entity<TextareaState>,
     original: Option<String>,
     is_null: bool,
+    use_default: bool,
     editable: bool,
 }
 
@@ -202,6 +206,8 @@ pub(crate) struct TableView {
     loading_row: bool,
     row_reads: usize,
     saving: bool,
+    inserting: bool,
+    editor_focus: Option<FocusHandle>,
     edit_error: Option<String>,
     error: Option<String>,
     query: TableQuery,
@@ -211,12 +217,18 @@ pub(crate) struct TableView {
     filter_value: Option<Entity<InputState>>,
     filter_task: Option<Task<()>>,
     filter_pending: bool,
+    importing: bool,
+    import_status: Option<String>,
+    import_failed: bool,
     exporting: bool,
     export_status: Option<String>,
     export_failed: bool,
 }
 
 pub(crate) struct QueryChanged;
+pub(crate) struct RowEditorOpened;
+
+impl EventEmitter<RowEditorOpened> for TableView {}
 
 impl EventEmitter<QueryChanged> for TableView {}
 impl EventEmitter<TableEvent> for TableView {}
@@ -287,6 +299,7 @@ impl TableView {
         self.table = None;
         self.fields.clear();
         self.selected_row = None;
+        self.inserting = false;
         self.filter_task = None;
         self.filter_pending = false;
         self.filter_column = None;
@@ -327,11 +340,11 @@ impl TableView {
     }
 
     pub(crate) fn is_busy(&self) -> bool {
-        self.loading || self.saving || self.row_reads > 0 || self.exporting
+        self.loading || self.saving || self.row_reads > 0 || self.exporting || self.importing
     }
 
     fn load(&mut self, query: TableQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if self.loading || self.saving || self.is_dirty(cx) {
+        if self.loading || self.saving || self.importing || self.is_dirty(cx) {
             return;
         }
         let Some(request) = self.request.clone() else {
@@ -343,6 +356,7 @@ impl TableView {
         self.error = None;
         self.fields.clear();
         self.selected_row = None;
+        self.inserting = false;
         self.loading_row = false;
         self.load_generation += 1;
         let generation = self.load_generation;
@@ -395,7 +409,7 @@ impl TableView {
     fn apply_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.filter_task = None;
         self.filter_pending = false;
-        if self.saving || self.is_dirty(cx) {
+        if self.saving || self.importing || self.is_dirty(cx) {
             return;
         }
         if self.loading {
@@ -457,6 +471,7 @@ impl TableView {
     ) {
         self.fields.clear();
         self.selected_row = None;
+        self.inserting = false;
         self.loading_row = false;
         self.load_generation += 1;
         match result {
@@ -594,7 +609,7 @@ impl TableView {
                     .row_header(false)
                 });
                 cx.subscribe_in(&table, window, |view, table, event, window, cx| {
-                    if view.loading {
+                    if view.loading || view.importing {
                         return;
                     }
                     match event {
@@ -618,7 +633,7 @@ impl TableView {
                             view.select_row(*ix, window, cx);
                         }
                         TableEvent::ClearSelection | TableEvent::SelectColumn(_) => {
-                            if view.saving {
+                            if view.saving || view.importing {
                                 return;
                             }
                             if view.is_dirty(cx) {
@@ -648,7 +663,8 @@ impl TableView {
     }
 
     fn export_rows(&mut self, format: ExportFormat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.exporting
+        if self.importing
+            || self.exporting
             || self.loading
             || self.saving
             || self.loading_row
@@ -711,6 +727,9 @@ impl TableView {
     }
 
     fn select_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.importing {
+            return;
+        }
         let Some(table) = &self.table else {
             return;
         };
@@ -808,6 +827,7 @@ impl TableView {
                     name: name.into(),
                     input,
                     is_null: original.is_none(),
+                    use_default: false,
                     original,
                     editable: schema.is_editable(ix),
                 }
@@ -816,7 +836,7 @@ impl TableView {
     }
 
     pub(crate) fn is_dirty(&self, cx: &App) -> bool {
-        self.fields.iter().any(|field| field.is_edited(cx))
+        self.inserting || self.fields.iter().any(|field| field.is_edited(cx))
     }
 
     pub(crate) fn prepare_to_close(&mut self, cx: &mut Context<Self>) -> bool {
@@ -833,7 +853,17 @@ impl TableView {
     }
 
     pub(crate) fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving || self.importing {
+            return;
+        }
+        if self.inserting {
+            self.inserting = false;
+            self.fields.clear();
+            self.selected_row = None;
+            self.edit_error = None;
+            cx.emit(TableEvent::ClearSelection);
+            self.focus(window, cx);
+            cx.notify();
             return;
         }
         for field in &mut self.fields {
@@ -848,7 +878,11 @@ impl TableView {
     }
 
     pub(crate) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.loading_row || !self.is_dirty(cx) {
+        if self.saving || self.importing || self.loading_row || !self.is_dirty(cx) {
+            return;
+        }
+        if self.inserting {
+            self.insert(window, cx);
             return;
         }
         let (Some(request), Some(table), Some(ix)) =
@@ -914,6 +948,7 @@ impl TableView {
     pub(crate) fn render_sidebar(&self, cx: &Context<Self>) -> Div {
         let dirty = self.is_dirty(cx);
         div()
+            .when_some(self.editor_focus.as_ref(), |panel, focus| panel.track_focus(focus))
             .flex()
             .flex_col()
             .gap_3()
@@ -928,7 +963,7 @@ impl TableView {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Row details"),
+                            .child(if self.inserting { "New row" } else { "Row details" }),
                     )
                     .when(dirty || self.saving, |header| {
                         header.child(
@@ -967,6 +1002,16 @@ impl TableView {
                         .child(error.clone()),
                 )
             })
+            .when(!self.fields.is_empty() && !self.inserting, |panel| {
+                let disabled = self.is_busy() || dirty || self.filter_pending || self.selected_row.is_none() || self.request.as_ref().is_none_or(|request| !request.session.is_connected()) || self.table.as_ref().is_none_or(|table| table.read(cx).delegate().data.schema.primary_key.is_empty());
+                panel.child(div().flex().flex_wrap().gap_2()
+                    .child(Button::new("duplicate-row").small().outline().label("Duplicate…").disabled(disabled)
+                        .on_click(cx.listener(|view, _, window, cx| view.new_row(true, window, cx))))
+                    .child(Button::new("delete-row").small().outline().label("Delete…").disabled(disabled)
+                        .on_click(cx.listener(|view, _, window, cx| view.confirm_delete(window, cx)))))
+            })
+            .when(self.inserting, |panel| panel.child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Unchecked defaults use the value or NULL below. Change copied unique keys before inserting.")))
             .child(
                 Form::new()
                     .children(self.fields.iter().enumerate().map(|(ix, field)| {
@@ -974,6 +1019,21 @@ impl TableView {
                             .label(field.name.clone())
                             .when(!field.editable, |field| {
                                 field.description("Cannot be edited")
+                            })
+                            .when(self.inserting, |element| {
+                                element.child(Checkbox::new(SharedString::from(format!("row-default-{}", field.name)))
+                                    .label("Use database default")
+                                    .accessibility_label(format!("Use database default for {}", field.name))
+                                    .checked(field.use_default)
+                                    .disabled(self.saving || !field.editable)
+                                    .on_click(cx.listener(move |view, checked, _, cx| {
+                                        if view.saving { return; }
+                                        if let Some(field) = view.fields.get_mut(ix) && field.editable {
+                                            field.use_default = *checked;
+                                            view.edit_error = None;
+                                            cx.notify();
+                                        }
+                                    })))
                             })
                             .child(
                                 Checkbox::new(SharedString::from(format!(
@@ -983,14 +1043,14 @@ impl TableView {
                                 .label("Use NULL")
                                 .accessibility_label(format!("Use NULL for {}", field.name))
                                 .checked(field.is_null)
-                                .disabled(self.saving || !field.editable)
+                                .disabled(self.saving || self.importing || !field.editable || field.use_default)
                                 .on_click(cx.listener(
                                     move |view, checked, _, cx| {
-                                        if view.saving {
+                                        if view.saving || view.importing {
                                             return;
                                         }
                                         if let Some(field) = view.fields.get_mut(ix)
-                                            && field.editable
+                                            && field.editable && !field.use_default
                                         {
                                             field.is_null = *checked;
                                             view.edit_error = None;
@@ -1006,7 +1066,13 @@ impl TableView {
                                         field.name
                                     )))
                                     .aria_label(field.name.clone())
-                                    .disabled(self.saving || !field.editable || field.is_null)
+                                    .disabled(
+                                        self.saving
+                                            || self.importing
+                                            || !field.editable
+                                            || field.is_null
+                                            || field.use_default,
+                                    )
                                     .small(),
                             )
                     }))
@@ -1017,7 +1083,7 @@ impl TableView {
                             .child(
                                 Button::new("save-row")
                                     .small()
-                                    .label("Save")
+                                    .label(if self.inserting { "Insert" } else { "Save" })
                                     .disabled(
                                         !dirty
                                             || self.saving
@@ -1034,7 +1100,7 @@ impl TableView {
                                     .small()
                                     .outline()
                                     .label("Cancel")
-                                    .disabled(!dirty || self.saving)
+                                    .disabled(!dirty || self.saving || self.importing)
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(Box::new(CancelRow), cx)
                                     }),
@@ -1103,7 +1169,7 @@ impl Render for TableView {
                     .zip(self.filter_operator.as_ref())
                     .zip(self.filter_value.as_ref()),
                 |view, ((column, operator), value)| {
-                    let busy = self.loading || self.saving || self.is_dirty(cx);
+                    let busy = self.loading || self.saving || self.importing || self.is_dirty(cx);
                     view.child(
                         div().id("filter-bar").test_support().flex_shrink_0().child(
                             div()
@@ -1142,14 +1208,14 @@ impl Render for TableView {
                                                 .small()
                                                 .flex_1()
                                                 .min_w_16()
-                                                .disabled(self.saving || self.is_dirty(cx)),
+                                                .disabled(self.saving || self.importing || self.is_dirty(cx)),
                                         )
                                         .child(
                                             Button::new("apply-filter")
                                                 .small()
                                                 .flex_shrink_0()
                                                 .label("Apply")
-                                                .disabled(self.saving || self.is_dirty(cx))
+                                                .disabled(self.saving || self.importing || self.is_dirty(cx))
                                                 .on_click(cx.listener(|view, _, window, cx| {
                                                     view.apply_filter(window, cx)
                                                 })),
@@ -1242,6 +1308,12 @@ impl Render for TableView {
                     .child(Button::new("reset-table-query").small().outline().label("Reset filters and sorting").disabled(self.is_busy())
                         .on_click(cx.listener(|view, _, window, cx| view.load(TableQuery::default(), window, cx)))))
             })
+            .when_some(self.import_status.as_ref(), |view, status| {
+                view.child(div().id("table-import-status").test_support().role(Role::Status)
+                    .aria_label(status.clone()).px_3().py_2().text_sm()
+                    .text_color(if self.import_failed { cx.theme().danger } else { cx.theme().muted_foreground })
+                    .child(status.clone()))
+            })
             .when_some(self.export_status.as_ref(), |view, status| {
                 view.child(div().id("table-export-status").test_support().role(Role::Status)
                     .aria_label(status.clone()).px_3().py_2().text_sm()
@@ -1259,7 +1331,7 @@ impl Render for TableView {
                 )
                 .child({
                     let data = &table.read(cx).delegate().data;
-                    let busy = self.loading || self.saving || self.is_dirty(cx);
+                    let busy = self.loading || self.saving || self.importing || self.is_dirty(cx);
                     let start = self.query.page * PAGE_SIZE;
                     let range = if data.rows.is_empty() {
                         "No rows".to_owned()
@@ -1312,6 +1384,17 @@ impl Render for TableView {
                                     query.page += 1;
                                     view.load(query, window, cx);
                                 })),
+                        )
+                        .child(
+                            Button::new("insert-row").small().ghost().label("Insert row…")
+                                .disabled(self.is_busy() || self.is_dirty(cx) || self.filter_pending || self.request.as_ref().is_none_or(|request| !request.session.is_connected()))
+                                .on_click(cx.listener(|view, _, window, cx| view.new_row(false, window, cx))),
+                        )
+                        .child(
+                            Button::new("import-table-csv")
+                                .small().ghost().label("Import CSV…")
+                                .disabled(self.is_busy() || self.is_dirty(cx) || self.filter_pending || self.request.as_ref().is_none_or(|request| !request.session.is_connected()))
+                                .on_click(cx.listener(|view, _, window, cx| view.choose_import(window, cx))),
                         )
                         .child(
                             Button::new("export-table-csv")
@@ -1448,12 +1531,13 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(WorkspaceFile::load(Some(path.clone())).1, state);
         // Every kind of table operation blocks both native close and tab close.
-        for operation in 0..4 {
+        for operation in 0..5 {
             cx.update(|cx| {
                 table.update(cx, |table, _| {
                     table.loading = operation == 0;
                     table.saving = operation == 1;
                     table.exporting = operation == 2;
+                    table.importing = operation == 4;
                     table.row_reads = usize::from(operation == 3);
                 })
             });
@@ -1477,6 +1561,7 @@ mod tests {
                 table.loading = false;
                 table.saving = false;
                 table.exporting = false;
+                table.importing = false;
                 table.row_reads = 0;
                 table.set_fields(
                     &TableSchema {
@@ -1720,14 +1805,15 @@ mod tests {
             !structure.read(cx).is_busy()
         })
         .await;
-        // All four table operation types protect even inactive tabs.
-        for operation in 0..4 {
+        // All table operation types protect even inactive tabs.
+        for operation in 0..5 {
             cx.update_window(handle.into(), |_, window, cx| {
                 table.update(cx, |table, _| {
                     table.loading = operation == 0;
                     table.saving = operation == 1;
                     table.row_reads = usize::from(operation == 2);
                     table.exporting = operation == 3;
+                    table.importing = operation == 4;
                 });
                 window.click("reconnect-connection", cx);
             })
@@ -1742,6 +1828,7 @@ mod tests {
                     table.saving = false;
                     table.row_reads = 0;
                     table.exporting = false;
+                    table.importing = false;
                 });
             })
             .unwrap();

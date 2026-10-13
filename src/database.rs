@@ -1,5 +1,9 @@
+mod row_operations;
+pub(crate) use row_operations::RowChange;
+
 use crate::{
     data_export::{ExportFormat, ExportWriter, QueryExport},
+    data_import::CsvImport,
     settings::{Connection, DatabaseKind},
 };
 use serde::{Deserialize, Serialize};
@@ -189,12 +193,13 @@ pub(crate) struct Session {
 }
 
 #[non_exhaustive]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct TableSchema {
     pub(crate) columns: Vec<String>,
     pub(crate) column_types: Vec<String>,
     pub(crate) primary_key: Vec<usize>,
     pub(crate) generated_columns: Vec<usize>,
+    pub(crate) auto_increment: Vec<usize>,
 }
 
 #[non_exhaustive]
@@ -394,7 +399,11 @@ async fn read_schema(
         if column.try_get::<String, _>(2)? == "PRI" {
             schema.primary_key.push(ix);
         }
-        if column.try_get::<String, _>(3)?.contains("GENERATED") {
+        let extra: String = column.try_get(3)?;
+        if extra.contains("auto_increment") {
+            schema.auto_increment.push(ix);
+        }
+        if extra.contains("GENERATED") {
             schema.generated_columns.push(ix);
         }
     }
@@ -764,6 +773,167 @@ impl Session {
             return Err(error);
         }
         writer.finish(path)
+    }
+
+    pub(crate) async fn import_record_limit(&self) -> Result<usize, String> {
+        let mut guard = self
+            .connection()
+            .await
+            .map_err(|error| self.database_error(error))?;
+        sqlx::query_scalar::<_, u64>("SELECT @@max_allowed_packet")
+            .fetch_one(guard.as_mut().unwrap())
+            .await
+            .map(|limit| limit as usize)
+            .map_err(|error| self.database_error(error))
+    }
+
+    async fn insert_import_batch(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        sql: &str,
+        schema: &TableSchema,
+        columns: &[(usize, usize)],
+        rows: &[Vec<Option<String>>],
+        first_record: u64,
+    ) -> Result<(), String> {
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(sql);
+        query.push_values(rows, |mut values, row| {
+            for (ix, (_, dest)) in columns.iter().enumerate() {
+                if schema.is_binary(*dest) {
+                    values
+                        .push("UNHEX(")
+                        .push_bind_unseparated(row[ix].as_deref())
+                        .push_unseparated(")");
+                } else {
+                    values.push_bind(row[ix].as_deref());
+                }
+            }
+        });
+        let records = format!(
+            "CSV records {first_record}–{}",
+            first_record + rows.len() as u64 - 1
+        );
+        query
+            .build()
+            .persistent(false)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("{records}: {}", self.database_error(error)))?;
+        let warnings: u64 = sqlx::query_scalar("SHOW COUNT(*) WARNINGS")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|error| self.database_error(error))?;
+        if warnings != 0 {
+            let warning = sqlx::query("SHOW WARNINGS LIMIT 1")
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|error| self.database_error(error))?;
+            let detail = warning
+                .map(|row| row.try_get::<String, _>(2))
+                .transpose()
+                .map_err(|error| self.database_error(error))?
+                .unwrap_or_else(|| "Database conversion warnings were reported.".into());
+            return Err(format!("{records}: {detail}"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn import_csv(
+        &self,
+        database: &str,
+        table: &str,
+        schema: &TableSchema,
+        csv: &CsvImport,
+        mapping: &[Option<String>],
+    ) -> Result<u64, String> {
+        let columns = csv.validate_mapping(schema, mapping)?;
+        let mut reader = csv.reader().map_err(|error| error.to_string())?;
+        let mut guard = self
+            .connection()
+            .await
+            .map_err(|error| self.database_error(error))?;
+        let connection = guard.as_mut().unwrap();
+        let active: i64 = sqlx::query_scalar("SELECT @@in_transaction OR NOT @@autocommit")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| self.database_error(error))?;
+        if active != 0 {
+            return Err("Commit or roll back the open SQL transaction and enable autocommit before importing.".into());
+        }
+        let packet_limit: u64 = sqlx::query_scalar("SELECT @@max_allowed_packet")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| self.database_error(error))?;
+        let target = format!("{}.{}", quote_identifier(database), quote_identifier(table));
+        let sql = format!(
+            "INSERT INTO {target} ({}) ",
+            columns
+                .iter()
+                .map(|(_, dest)| quote_identifier(&schema.columns[*dest]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|error| self.database_error(error))?;
+        let result = async {
+            self.validate_row_write(&mut transaction, database, table, schema).await?;
+            let batch_limit = (1024 * 1024).min(packet_limit.saturating_sub(sql.len() as u64 + 64) as usize);
+            let batch_rows = 1000.min(60_000 / columns.len());
+            if batch_rows == 0 { return Err("Too many mapped columns for a database INSERT.".into()); }
+            let mut batch = Vec::new();
+            let mut batch_bytes = 0;
+            let mut rows = 0_u64;
+            let mut read_rows = 0_u64;
+            while let Some(mut row) = reader.read_record().map_err(|error| error.to_string())? {
+                read_rows += 1;
+                csv.validate_row(schema, &columns, &row, read_rows + 1).map_err(|error| error.to_string())?;
+                // Allow for bind types, length prefixes, placeholders, and protocol headers.
+                let bytes = columns.iter().map(|(source, _)| row[*source].as_ref().map_or(0, String::len) + 32).sum::<usize>() + 8;
+                if bytes as u64 + sql.len() as u64 + 64 > packet_limit {
+                    return Err(format!("CSV record {} exceeds this connection’s max_allowed_packet limit. Increase the server setting and reconnect.", read_rows + 1));
+                }
+                if !batch.is_empty() && (batch.len() == batch_rows || batch_bytes + bytes > batch_limit) {
+                    csv.verify_unchanged(&reader).map_err(|error| error.to_string())?;
+                    self.insert_import_batch(&mut transaction, &sql, schema, &columns, &batch, rows + 2).await?;
+                    rows += batch.len() as u64;
+                    batch.clear(); batch_bytes = 0;
+                    csv.set_progress(rows, reader.bytes());
+                }
+                let values = columns.iter().map(|(source, _)| row[*source].take()).collect();
+                drop(row);
+                batch_bytes += bytes;
+                batch.push(values);
+            }
+            if !batch.is_empty() {
+                self.insert_import_batch(&mut transaction, &sql, schema, &columns, &batch, rows + 2).await?;
+                rows += batch.len() as u64;
+            }
+            csv.verify_unchanged(&reader).map_err(|error| error.to_string())?;
+            csv.set_progress(rows, reader.bytes());
+            Ok(rows)
+        }.await;
+        match result {
+            Ok(rows) => {
+                transaction.commit().await.map_err(|error| {
+                    format!(
+                        "Couldn’t confirm import: {}. Refresh the table to check before retrying.",
+                        self.database_error(error)
+                    )
+                })?;
+                Ok(rows)
+            }
+            Err(error) => {
+                transaction.rollback().await.map_err(|rollback| {
+                    format!(
+                        "{error} Rollback failed: {}. Check the table before retrying.",
+                        self.database_error(rollback)
+                    )
+                })?;
+                Err(format!("{error} No rows were imported."))
+            }
+        }
     }
 
     pub(crate) async fn read_row(
