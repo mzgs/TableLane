@@ -1,6 +1,6 @@
 # TableLane feature progress
 
-Updated: 2026-10-12. Continue from this file in later sessions.
+Updated: 2026-10-13. Continue from this file in later sessions.
 
 ## Scope
 
@@ -18,15 +18,15 @@ protection against unsaved edits and concurrent database changes.
 - [x] Data transfer
   - [x] CSV/JSON export of full table/query values (never truncated previews)
   - [x] CSV import with column mapping, validation, and transaction rollback
-- [ ] Row operations
+- [x] Row operations
   - [x] Insert, duplicate, delete with appropriate confirmation
-  - [ ] Bulk actions with stable row identity
+  - [x] Bulk actions with stable row identity (selection and transactional delete)
   - [x] Explicit NULL control, distinct from empty strings
 - [x] Workspace recovery
   - [x] Persist and restore SQL drafts and tabs
   - [x] Persist table filters, sorting, and pagination
   - [x] Protect unsaved work when quitting
-- [ ] Query cancellation without leaving a busy/broken shared session
+- [x] Query cancellation without leaving a busy/broken shared session
 - [ ] SQL workflow
   - [x] Run selected SQL
   - [ ] Multi-statement scripts and multiple result sets
@@ -361,10 +361,98 @@ protection against unsaved edits and concurrent database changes.
   cancellation, and role-only trigger privileges remain unimplemented.
 - README updated; no dependencies, credential-storage changes, or commit added.
 
+### 2026-10-13 — Bulk row selection and deletion
+
+- Added a Select checkbox column to tables with primary keys and a selection
+  count with Delete selected… / Clear selection controls. Pointer activation
+  keeps the active row inspector separate; keyboard focus and Space activate
+  the same checkbox behavior. Full current values load when selecting a row.
+- Selection uses complete primary keys, including composite and binary keys,
+  and survives paging, filtering, sorting, and refresh. The count and danger
+  confirmation explicitly include hidden selections. Schema changes detected
+  on refresh, disconnect, and successful bulk deletion clear selection.
+- Deletes share the existing row-write validation and use one transaction for
+  the entire selection. All original rows are compared and locked before any
+  delete, preserving NULL, empty text, binary data, and full-value conflicts.
+  Missing/changed rows, constraints, and warnings reject the entire operation.
+  Selected self-referencing rows work with CASCADE and SET NULL foreign keys.
+- Confirmation rechecks selection generation, session, draft, and busy state.
+  Failed deletes preserve selection and show an inline error; clear and reselect
+  current rows before retrying a conflict. Selection reads and running deletes
+  reuse the existing tab, quit, connection, and schema guards.
+- Selection is temporary and excluded from workspace recovery. Full selected
+  values stay in memory; memory grows with their count and size. There is no
+  select-all-matching command, bulk field editing, or cancellation yet.
+- Verification:
+  - Final isolated MariaDB serial regression:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --skip csv_streaming_16_gib --test-threads=1`:
+    55 passed, including all 22 live MariaDB tests and debug startup.
+  - New database coverage verifies complete composite/binary keys, duplicate
+    selection rejection, full-value concurrent changes, missing rows, rollback
+    after foreign-key errors, open-transaction preservation, and self-cascades.
+  - Production UI checks cover pointer/keyboard selection, deselection, full
+    snapshot values, selection across pages/sorting/filters, confirmation
+    cancellation, conflict retention, busy rechecks, clearing, and page reset.
+    Existing row-editor coordinate tests now target data after the new column.
+  - An earlier regression hit the documented unchanged connection-dialog
+    assertion and schema UI timeout. The final full serial run passed. The
+    unchanged 16 GiB streaming parser stress check was not repeated.
+  - Clippy with -D warnings, formatting, and diff checks passed.
+  - Temporary servers shut down; saved user settings and SQL history untouched.
+- Remaining checks: manual native-window/theme/zoom review. Large-selection
+  memory use, select-all matching rows, and bulk field editing remain outside
+  this batch. Query cancellation is the next checklist item.
+- README updated; no dependencies, credential-storage changes, or commit added.
+
+### 2026-10-13 — SQL query cancellation
+
+- SQL execution now offers Cancel and Cmd/Ctrl+. while running. The editor is
+  readonly during execution so focus, text selection, copying, and cancellation
+  remain available. The shortcut also works from the surrounding workspace;
+  while running it intercepts the editor's existing code-actions shortcut.
+- Each run owns a cancellation handle and unique SQL comment. A separate
+  connection using the live session's original options finds its exact MariaDB
+  query ID and sends KILL SOFT QUERY ID. Late requests cannot interrupt another
+  tab's query or a later command. Pending runs wake and cancel without acquiring
+  the shared connection or executing their SQL.
+- SQL work and control requests use the existing async runtime. Cancellation
+  keeps the tab busy until the original response is consumed and the control
+  request settles. The shared session survives ordinary cancellation with its
+  variables, temporary tables, and open transaction intact. Partial snapshots
+  are discarded; drafts and original executed SQL remain in workspace/history.
+- Each control request has a five-second timeout, inline errors, and retry.
+  Failed requests keep waiting for the original SQL instead of abandoning its
+  socket. Soft cancellation can leave protected MyISAM/Aria repair/index work
+  running until completion. Cancellation cannot guarantee rollback of writes;
+  late completion reports discarded results and asks users to check writes
+  before retrying. Existing SQL transactions still require COMMIT or ROLLBACK.
+- Running SQL and pending control requests participate in the existing tab,
+  native-close, quit, schema, and connection lifecycle guards, including inactive
+  tabs. Cancellation applies to SQL execution; imports, row writes, table reads,
+  and file exports retain their existing guards without Cancel controls.
+- Verification:
+  - Isolated MariaDB full serial regression:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --skip csv_streaming_16_gib --test-threads=1`:
+    58 passed, including all 25 live MariaDB tests and debug startup.
+  - New database checks cover queued cancellation, running reads/writes and
+    streamed rows, full session reuse, transaction preservation, accounts without
+    administrative grants, late requests, and failed control authentication.
+  - Production UI checks cover the Cancel button, repeated submissions, both
+    keyboard shortcuts, readonly drafts, inactive-query quit protection, exact
+    history text/status, discarded exports, and rerunning on the same session.
+    Live SQL UI tests allow external I/O in GPUI's test scheduler.
+  - Clippy with -D warnings, formatting, and diff checks passed.
+  - Temporary servers shut down; user settings and SQL history untouched.
+  - The unchanged 16 GiB parser stress test was not repeated.
+- Remaining checks: manual native-window/theme/zoom review. Protected server
+  work or a failed cancellation request can keep SQL running; the busy guards
+  stay active until that execution actually finishes.
+- README updated; no dependencies, credential-storage changes, or commit added.
+
 ## Continuation notes
 
-- Next batch: bulk row actions with stable primary-key identity and confirmation,
-  then query cancellation. Keep every incomplete checkbox visible until verified.
+- Next batch: multi-statement SQL scripts and multiple result sets, then saved
+  queries and browsing beyond 1,000 rows. Keep incomplete checkboxes visible.
 - The full roadmap is not complete.
 - Edited connections apply to future sessions; existing tabs retain their old
   session and label. Retained sessions remain controllable through “Previous
@@ -381,6 +469,8 @@ protection against unsaved edits and concurrent database changes.
   session Arcs. The app shell guards lifecycle commands across every affected
   tab. Keep these guards when adding row operations.
 - `src/database.rs` shares one mutex-protected MySQL connection per session.
+  SQL cancellation lives in `src/database/cancellation.rs`; preserve its exact
+  query targeting, queued wakeup, response draining, and transaction behavior.
   Cancellation must stop the server query, not only abandon the UI task.
 - Table previews and SQL results truncate values. Table export fetches full values
   in one streaming SELECT; SQL export reads the private temporary snapshot from

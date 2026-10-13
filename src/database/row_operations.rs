@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone, Copy)]
 pub(crate) enum RowChange<'a> {
     Insert(&'a [Option<Option<String>>]),
     Delete(&'a [Option<String>]),
@@ -65,78 +66,42 @@ impl Session {
         schema: &TableSchema,
         change: RowChange<'_>,
     ) -> Result<(), String> {
-        let target = format!("{}.{}", quote_identifier(database), quote_identifier(table));
-        let (sql, bindings) =
-            match change {
-                RowChange::Insert(values) => {
-                    if values.len() != schema.columns.len() {
-                        return Err("The row no longer matches the table columns.".into());
-                    }
-                    let mut columns = Vec::new();
-                    let mut parameters = Vec::new();
-                    let mut bindings = Vec::new();
-                    for (ix, value) in values.iter().enumerate() {
-                        let Some(value) = value else { continue };
-                        if !schema.is_editable(ix) {
-                            return Err(format!(
-                                "{} cannot be inserted. Use its database default.",
-                                schema.columns[ix]
-                            ));
-                        }
-                        if schema.is_binary(ix)
-                            && value.as_ref().is_some_and(|value| {
-                                value.len() % 2 != 0
-                                    || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            })
-                        {
-                            return Err(format!(
-                                "{} must contain pairs of hexadecimal digits.",
-                                schema.columns[ix]
-                            ));
-                        }
-                        columns.push(quote_identifier(&schema.columns[ix]));
-                        parameters.push(schema.parameter(ix));
-                        bindings.push(value.clone());
-                    }
-                    (
-                        format!(
-                            "INSERT INTO {target} ({}) VALUES ({})",
-                            columns.join(", "),
-                            parameters.join(", ")
-                        ),
-                        bindings,
-                    )
-                }
-                RowChange::Delete(original) => {
-                    schema.row_query(database, table)?;
-                    if original.len() != schema.columns.len() {
-                        return Err("The row no longer matches the table columns.".into());
-                    }
-                    let mut predicates = schema
-                        .primary_key
-                        .iter()
-                        .map(|ix| {
-                            format!(
-                                "{} <=> {}",
-                                quote_identifier(&schema.columns[*ix]),
-                                schema.parameter(*ix)
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    predicates.extend((0..original.len()).map(|ix| {
-                        format!("BINARY ({}) <=> BINARY (?)", schema.expression(ix, false))
-                    }));
-                    let mut bindings = schema.key(original);
-                    bindings.extend_from_slice(original);
-                    (
-                        format!(
-                            "DELETE FROM {target} WHERE {} LIMIT 1",
-                            predicates.join(" AND ")
-                        ),
-                        bindings,
-                    )
-                }
-            };
+        self.change_rows(database, table, schema, &[change]).await
+    }
+
+    pub(crate) async fn delete_rows(
+        &self,
+        database: &str,
+        table: &str,
+        schema: &TableSchema,
+        originals: &[Vec<Option<String>>],
+    ) -> Result<(), String> {
+        if originals.is_empty() {
+            return Err("Select rows before deleting.".into());
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for original in originals {
+            if original.len() != schema.columns.len() {
+                return Err("The row no longer matches the table columns.".into());
+            }
+            if !keys.insert(schema.key(original)) {
+                return Err("A row was selected more than once.".into());
+            }
+        }
+        let changes = originals
+            .iter()
+            .map(|row| RowChange::Delete(row))
+            .collect::<Vec<_>>();
+        self.change_rows(database, table, schema, &changes).await
+    }
+
+    async fn change_rows(
+        &self,
+        database: &str,
+        table: &str,
+        schema: &TableSchema,
+        changes: &[RowChange<'_>],
+    ) -> Result<(), String> {
         let mut guard = self
             .connection()
             .await
@@ -156,29 +121,62 @@ impl Session {
         let result = async {
             self.validate_row_write(&mut transaction, database, table, schema)
                 .await?;
-            let mut statement = sqlx::query(&sql).persistent(false);
-            for value in bindings {
-                statement = statement.bind(value);
+            // Check and lock every original before any delete, including rows a
+            // self-referencing foreign key might delete or change through a cascade.
+            for change in changes {
+                let RowChange::Delete(original) = change else {
+                    continue;
+                };
+                if original.len() != schema.columns.len() {
+                    return Err("The row no longer matches the table columns.".into());
+                }
+                let sql = format!("{} FOR UPDATE", schema.row_query(database, table)?);
+                let mut statement = sqlx::query(&sql);
+                for key in schema.key(original) {
+                    statement = statement.bind(key);
+                }
+                let current = statement
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|error| self.database_error(error))?;
+                let current = current
+                    .map(|row| {
+                        (0..schema.columns.len())
+                            .map(|ix| row.try_get::<Option<String>, _>(ix))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                    .map_err(|error| self.database_error(error))?;
+                if current.as_deref() != Some(*original) {
+                    return Err("The row changed or was deleted. Clear the selection and refresh the table before retrying.".into());
+                }
             }
-            let result = statement
-                .execute(&mut *transaction)
-                .await
-                .map_err(|error| self.database_error(error))?;
-            if result.rows_affected() != 1 {
-                return Err(
-                    "The row changed or was deleted. Cancel and refresh the table before retrying."
-                        .into(),
-                );
-            }
-            let warnings: u64 = sqlx::query_scalar("SHOW COUNT(*) WARNINGS")
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|error| self.database_error(error))?;
-            if warnings != 0 {
-                return Err(
-                    "The database reported conversion warnings; the row operation was rolled back."
-                        .into(),
-                );
+            for change in changes {
+                let (sql, bindings) = row_statement(database, table, schema, *change)?;
+                let mut statement = sqlx::query(&sql).persistent(false);
+                for value in bindings {
+                    statement = statement.bind(value);
+                }
+                let result = statement
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| self.database_error(error))?;
+                if result.rows_affected() != 1 && !matches!(change, RowChange::Delete(_)) {
+                    return Err(
+                        "The row changed or was deleted. Cancel and refresh the table before retrying."
+                            .into(),
+                    );
+                }
+                let warnings: u64 = sqlx::query_scalar("SHOW COUNT(*) WARNINGS")
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|error| self.database_error(error))?;
+                if warnings != 0 {
+                    return Err(
+                        "The database reported conversion warnings; the row operation was rolled back."
+                            .into(),
+                    );
+                }
             }
             Ok(())
         }
@@ -201,6 +199,81 @@ impl Session {
             }
         }
     }
+}
+
+fn row_statement(
+    database: &str,
+    table: &str,
+    schema: &TableSchema,
+    change: RowChange<'_>,
+) -> Result<(String, Vec<Option<String>>), String> {
+    let target = format!("{}.{}", quote_identifier(database), quote_identifier(table));
+    let statement = match change {
+        RowChange::Insert(values) => {
+            if values.len() != schema.columns.len() {
+                return Err("The row no longer matches the table columns.".into());
+            }
+            let mut columns = Vec::new();
+            let mut parameters = Vec::new();
+            let mut bindings = Vec::new();
+            for (ix, value) in values.iter().enumerate() {
+                let Some(value) = value else { continue };
+                if !schema.is_editable(ix) {
+                    return Err(format!(
+                        "{} cannot be inserted. Use its database default.",
+                        schema.columns[ix]
+                    ));
+                }
+                if schema.is_binary(ix)
+                    && value.as_ref().is_some_and(|value| {
+                        value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(format!(
+                        "{} must contain pairs of hexadecimal digits.",
+                        schema.columns[ix]
+                    ));
+                }
+                columns.push(quote_identifier(&schema.columns[ix]));
+                parameters.push(schema.parameter(ix));
+                bindings.push(value.clone());
+            }
+            (
+                format!(
+                    "INSERT INTO {target} ({}) VALUES ({})",
+                    columns.join(", "),
+                    parameters.join(", ")
+                ),
+                bindings,
+            )
+        }
+        RowChange::Delete(original) => {
+            schema.row_query(database, table)?;
+            if original.len() != schema.columns.len() {
+                return Err("The row no longer matches the table columns.".into());
+            }
+            let predicates = schema
+                .primary_key
+                .iter()
+                .map(|ix| {
+                    format!(
+                        "{} <=> {}",
+                        quote_identifier(&schema.columns[*ix]),
+                        schema.parameter(*ix)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let bindings = schema.key(original);
+            (
+                format!(
+                    "DELETE FROM {target} WHERE {} LIMIT 1",
+                    predicates.join(" AND ")
+                ),
+                bindings,
+            )
+        }
+    };
+    Ok(statement)
 }
 
 #[cfg(test)]
@@ -595,6 +668,198 @@ mod tests {
             );
             session
                 .run_sql("mysql", "DROP DATABASE row_change_test")
+                .await
+                .unwrap();
+        });
+    }
+    #[test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    fn mariadb_bulk_delete_uses_full_composite_keys_and_rolls_back_all_rows() {
+        async_std::task::block_on(async {
+            let config = Connection {
+                name: "Bulk operations".into(),
+                database_type: DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(
+                    std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                ),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            };
+            let session = super::super::connect(&config).await.unwrap();
+            let other = super::super::connect(&config).await.unwrap();
+            let db = "bulk_delete_test";
+            session
+                .run_sql("mysql", "CREATE DATABASE bulk_delete_test")
+                .await
+                .unwrap();
+            session.run_sql(db, "CREATE TABLE widgets (id INT, token VARBINARY(1000), body LONGTEXT, empty TEXT, PRIMARY KEY (id, token)) ENGINE=InnoDB").await.unwrap();
+            session.run_sql(db, "INSERT INTO widgets VALUES (1, REPEAT(X'A0FF', 260), CONCAT(REPEAT('x', 300), 'one'), ''), (1, X'00FF', NULL, ''), (2, X'00FF', CONCAT(REPEAT('x', 300), 'two'), NULL)").await.unwrap();
+            let data = session
+                .read_table(db, "widgets", &TableQuery::default())
+                .await
+                .unwrap();
+            let mut originals = Vec::new();
+            for key in &data.keys {
+                originals.push(
+                    session
+                        .read_row(db, "widgets", &data.schema, key)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert!(
+                session
+                    .delete_rows(db, "widgets", &data.schema, &[])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                session
+                    .delete_rows(
+                        db,
+                        "widgets",
+                        &data.schema,
+                        &[originals[0].clone(), originals[0].clone()]
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("more than once")
+            );
+            // A suffix hidden by the preview changes after selection. Earlier deletes must roll back.
+            other
+                .run_sql(
+                    db,
+                    "UPDATE widgets SET body = CONCAT(body, 'changed') WHERE id = 2",
+                )
+                .await
+                .unwrap();
+            assert!(
+                session
+                    .delete_rows(db, "widgets", &data.schema, &originals)
+                    .await
+                    .unwrap_err()
+                    .contains("row changed")
+            );
+            assert_eq!(
+                session
+                    .read_table(db, "widgets", &TableQuery::default())
+                    .await
+                    .unwrap()
+                    .rows
+                    .len(),
+                3
+            );
+            originals[2] = session
+                .read_row(db, "widgets", &data.schema, &data.keys[2])
+                .await
+                .unwrap();
+            session.run_sql(db, "CREATE TABLE related (parent INT, token VARBINARY(1000), FOREIGN KEY (parent, token) REFERENCES widgets(id, token)) ENGINE=InnoDB").await.unwrap();
+            session
+                .run_sql(db, "INSERT INTO related VALUES (2, X'00FF')")
+                .await
+                .unwrap();
+            assert!(
+                session
+                    .delete_rows(db, "widgets", &data.schema, &originals)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                session
+                    .read_table(db, "widgets", &TableQuery::default())
+                    .await
+                    .unwrap()
+                    .rows
+                    .len(),
+                3
+            );
+            session.run_sql(db, "DROP TABLE related").await.unwrap();
+            session.run_sql(db, "START TRANSACTION").await.unwrap();
+            assert!(
+                session
+                    .delete_rows(db, "widgets", &data.schema, &originals)
+                    .await
+                    .unwrap_err()
+                    .contains("open SQL transaction")
+            );
+            assert_eq!(
+                session
+                    .run_sql(db, "SELECT @@in_transaction")
+                    .await
+                    .unwrap()
+                    .0
+                    .rows[0][0]
+                    .as_deref(),
+                Some("1")
+            );
+            session.run_sql(db, "ROLLBACK").await.unwrap();
+            other
+                .run_sql(db, "DELETE FROM widgets WHERE id = 2")
+                .await
+                .unwrap();
+            assert!(
+                session
+                    .delete_rows(db, "widgets", &data.schema, &originals)
+                    .await
+                    .unwrap_err()
+                    .contains("row changed")
+            );
+            assert_eq!(
+                session
+                    .read_table(db, "widgets", &TableQuery::default())
+                    .await
+                    .unwrap()
+                    .rows
+                    .len(),
+                2
+            );
+            session
+                .delete_rows(db, "widgets", &data.schema, &originals[..2])
+                .await
+                .unwrap();
+            assert!(
+                session
+                    .read_table(db, "widgets", &TableQuery::default())
+                    .await
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+            for rule in ["CASCADE", "SET NULL"] {
+                session.run_sql(db, &format!("CREATE TABLE tree (id INT PRIMARY KEY, parent INT, body TEXT, FOREIGN KEY (parent) REFERENCES tree(id) ON DELETE {rule}) ENGINE=InnoDB")).await.unwrap();
+                session
+                    .run_sql(
+                        db,
+                        "INSERT INTO tree VALUES (1, NULL, 'parent'), (2, 1, 'child')",
+                    )
+                    .await
+                    .unwrap();
+                let data = session
+                    .read_table(db, "tree", &TableQuery::default())
+                    .await
+                    .unwrap();
+                session
+                    .delete_rows(db, "tree", &data.schema, &data.rows)
+                    .await
+                    .unwrap();
+                assert!(
+                    session
+                        .read_table(db, "tree", &TableQuery::default())
+                        .await
+                        .unwrap()
+                        .rows
+                        .is_empty()
+                );
+                session.run_sql(db, "DROP TABLE tree").await.unwrap();
+            }
+            session
+                .run_sql("mysql", "DROP DATABASE bulk_delete_test")
                 .await
                 .unwrap();
         });

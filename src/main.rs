@@ -153,6 +153,8 @@ impl AppView {
             KeyBinding::new("ctrl-w", CloseTab, Some("TableWorkspace")),
             KeyBinding::new("ctrl-tab", NextTab, Some("TableWorkspace")),
             KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("TableWorkspace")),
+            KeyBinding::new("cmd-.", sql_editor::CancelSql, Some("TableWorkspace")),
+            KeyBinding::new("ctrl-.", sql_editor::CancelSql, Some("TableWorkspace")),
         ]);
         let mut window_state = restored.unwrap_or_else(|| WindowState::capture(window));
         window_state.update(window);
@@ -993,6 +995,11 @@ impl Render for AppView {
             .size_full()
             .track_focus(&self.focus)
             .key_context("TableWorkspace")
+            .on_action(cx.listener(|view, _: &sql_editor::CancelSql, window, cx| {
+                if let Some(WorkspaceTab::Sql(editor, _)) = view.tabs.get(view.active_tab) {
+                    editor.update(cx, |editor, cx| editor.cancel_sql(window, cx));
+                }
+            }))
             .on_action(cx.listener(|view, _: &CloseTab, window, cx| {
                 if let Some(tab) = view.tabs.get(view.active_tab) {
                     view.close_tab(tab.id(), window, cx);

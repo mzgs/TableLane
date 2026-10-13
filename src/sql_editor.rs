@@ -1,7 +1,7 @@
 use crate::{
     connections::OpenTable,
     data_export::{ExportFormat, QueryExport},
-    database::TableRows,
+    database::{QueryCancellation, TableRows},
     workspace_state::SqlDraft,
 };
 mod history;
@@ -107,7 +107,7 @@ impl CompletionProvider for SqlCompletions {
     }
 }
 
-actions!(sql_editor, [RunSql, ToggleSqlComment]);
+actions!(sql_editor, [RunSql, CancelSql, ToggleSqlComment]);
 
 fn selected_sql(sql: &str, selection: std::ops::Range<usize>) -> &str {
     if selection.is_empty() {
@@ -210,6 +210,9 @@ pub(crate) struct SqlEditor {
     input: Entity<EditorState>,
     results: Option<Entity<TableState<Results>>>,
     running: bool,
+    cancellation: Option<std::sync::Arc<QueryCancellation>>,
+    cancelling: bool,
+    cancel_error: Option<String>,
     status: String,
     failed: bool,
     export: Option<std::sync::Arc<QueryExport>>,
@@ -244,6 +247,8 @@ impl SqlEditor {
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunSql, Some("SqlEditor")),
             KeyBinding::new("ctrl-enter", RunSql, Some("SqlEditor")),
+            KeyBinding::new("cmd-.", CancelSql, Some("SqlEditor")),
+            KeyBinding::new("ctrl-.", CancelSql, Some("SqlEditor")),
             KeyBinding::new("cmd-/", ToggleSqlComment, Some("SqlEditor")),
         ]);
         let input = cx.new(|cx| {
@@ -275,6 +280,9 @@ impl SqlEditor {
             input,
             results: None,
             running: false,
+            cancellation: None,
+            cancelling: false,
+            cancel_error: None,
             status: "Run a statement to see its results".into(),
             failed: false,
             export: None,
@@ -285,7 +293,7 @@ impl SqlEditor {
     }
 
     pub(crate) fn is_busy(&self) -> bool {
-        self.running || self.exporting
+        self.running || self.cancelling || self.exporting
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -391,10 +399,13 @@ impl SqlEditor {
         let input = self.input.read(cx);
         let text = input.value();
         let sql = selected_sql(&text, input.selected_range()).to_owned();
-        if self.running || self.exporting || self.request.is_none() || sql.trim().is_empty() {
+        if self.is_busy() || self.request.is_none() || sql.trim().is_empty() {
             return;
         }
         self.running = true;
+        let cancellation = std::sync::Arc::new(QueryCancellation::new());
+        self.cancellation = Some(cancellation.clone());
+        self.cancel_error = None;
         self.failed = false;
         self.status = "Running SQL…".into();
         self.results = None;
@@ -405,15 +416,24 @@ impl SqlEditor {
         };
         let history_sql = sql.clone();
         let task = cx.background_spawn(async move {
-            let start = std::time::Instant::now();
-            let result =
-                async_std::task::block_on(request.session.run_sql_export(&request.database, &sql));
-            (result, start.elapsed())
+            async_std::task::spawn(async move {
+                let start = std::time::Instant::now();
+                let result = request
+                    .session
+                    .run_sql_export(&request.database, &sql, &cancellation)
+                    .await;
+                (result, start.elapsed(), cancellation.is_result_discarded())
+            })
+            .await
         });
         cx.spawn_in(window, async move |editor, cx| {
-            let (result, elapsed) = task.await;
+            let (result, elapsed, discarded) = task.await;
             let _ = editor.update_in(cx, |editor, window, cx| {
                 editor.running = false;
+                editor.cancellation = None;
+                if discarded {
+                    editor.cancel_error = None;
+                }
                 match result {
                     Ok((data, affected, export)) => {
                         editor.status = format!(
@@ -449,7 +469,7 @@ impl SqlEditor {
                     }
                     Err(error) => {
                         editor.status = error;
-                        editor.failed = true;
+                        editor.failed = !discarded;
                     }
                 }
                 cx.global_mut::<History>().record(
@@ -459,6 +479,34 @@ impl SqlEditor {
                     editor.status.clone(),
                     editor.failed,
                 );
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.running || self.cancelling {
+            return;
+        }
+        let (Some(cancellation), Some(request)) = (self.cancellation.clone(), self.request.clone())
+        else {
+            return;
+        };
+        self.cancelling = true;
+        self.cancel_error = None;
+        self.status = "Cancellation requested; waiting for SQL to finish…".into();
+        let task = cx.background_spawn(async move {
+            async_std::task::spawn(async move { cancellation.cancel(&request.session).await }).await
+        });
+        cx.spawn_in(window, async move |editor, cx| {
+            let result = task.await;
+            let _ = editor.update_in(cx, |editor, _, cx| {
+                editor.cancelling = false;
+                if let Err(error) = result {
+                    editor.cancel_error = Some(error);
+                }
                 cx.notify();
             });
         })
@@ -667,7 +715,16 @@ impl Render for SqlEditor {
                     }
                 },
             ))
+            .capture_action(cx.listener(
+                |editor, _: &gpui_kit::component::input::ToggleCodeActions, window, cx| {
+                    if editor.running {
+                        cx.stop_propagation();
+                        editor.cancel_sql(window, cx);
+                    }
+                },
+            ))
             .on_action(cx.listener(|editor, _: &RunSql, window, cx| editor.run(window, cx)))
+            .on_action(cx.listener(|editor, _: &CancelSql, window, cx| editor.cancel_sql(window, cx)))
             .on_action(cx.listener(|editor, _: &ToggleSqlComment, window, cx| {
                 editor.toggle_comment(window, cx)
             }))
@@ -701,7 +758,7 @@ impl Render for SqlEditor {
                     Editor::new(&self.input)
                         .aria_label("SQL statement")
                         .h(rems(10.))
-                        .disabled(self.running),
+                        .readonly(self.running),
                 ),
             )
             .child(
@@ -719,9 +776,15 @@ impl Render for SqlEditor {
                             .label("Run")
                             .tooltip("Run selected SQL, or the whole statement (Cmd/Ctrl+Enter)")
                             .loading(self.running)
-                            .disabled(self.running || self.exporting || self.request.as_ref().is_none_or(|request| !request.session.is_connected()) || self.input.read(cx).value().trim().is_empty())
+                            .disabled(self.is_busy() || self.request.as_ref().is_none_or(|request| !request.session.is_connected()) || self.input.read(cx).value().trim().is_empty())
                             .on_click(cx.listener(|editor, _, window, cx| editor.run(window, cx))),
                     )
+                    .when(self.running || self.cancelling, |controls| controls.child(
+                        Button::new("cancel-sql").small().outline().label("Cancel")
+                            .tooltip("Cancel this SQL execution (Cmd/Ctrl+.)")
+                            .loading(self.cancelling).disabled(!self.running || self.cancelling)
+                            .on_click(cx.listener(|editor, _, window, cx| editor.cancel_sql(window, cx)))
+                    ))
                     .child(
                         Button::new("sql-history")
                             .small()
@@ -809,6 +872,11 @@ impl Render for SqlEditor {
                     .text_color(if self.export_failed { cx.theme().danger } else { cx.theme().muted_foreground })
                     .child(status.clone()))
             })
+            .when_some(self.cancel_error.as_ref(), |view, error| {
+                view.child(div().id("sql-cancel-error").test_support().role(Role::Status)
+                    .aria_label(error.clone()).px_3().pb_2().text_sm().text_color(cx.theme().danger)
+                    .child(error.clone()))
+            })
             .when_some(self.results.as_ref(), |view, results| {
                 view.child(
                     div()
@@ -849,6 +917,7 @@ mod tests {
     async fn mariadb_restored_drafts_attach_only_to_their_connection_without_execution(
         cx: &mut TestAppContext,
     ) {
+        cx.background_executor.allow_parking();
         use crate::workspace_state::{SavedTab, SqlDraft, WorkspaceFile, WorkspaceState};
         let directory =
             std::env::temp_dir().join(format!("tablelane-workspace-live-{}", std::process::id()));
@@ -1077,6 +1146,7 @@ mod tests {
     async fn mariadb_exports_tables_and_completed_sql_without_repeating_statements(
         cx: &mut TestAppContext,
     ) {
+        cx.background_executor.allow_parking();
         let session = std::sync::Arc::new(
             async_std::task::block_on(crate::database::connect(&Connection {
                 name: "Export test".into(),
@@ -1341,6 +1411,7 @@ mod tests {
     #[gpui_kit::test]
     #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
     async fn mariadb_tabs_preserve_sql_drafts_results_and_confirm_discard(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
         let session = std::sync::Arc::new(
             async_std::task::block_on(crate::database::connect(&Connection {
                 name: "Test".into(),
@@ -1526,6 +1597,7 @@ mod tests {
     #[gpui_kit::test]
     #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
     async fn mariadb_sql_editor_runs_statements_with_pointer_and_keyboard(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
         let port = std::env::var("TABLELANE_TEST_MARIADB_PORT")
             .unwrap()
             .parse()
@@ -1799,5 +1871,214 @@ mod tests {
                 .await
                 .unwrap();
         });
+    }
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_sql_cancel_controls_queue_keyboard_history_and_session_reuse(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        use std::{sync::Arc, time::Duration};
+        let config = Connection {
+            name: "Cancel UI".into(),
+            database_type: DatabaseKind::MariaDB,
+            host: "127.0.0.1".into(),
+            port: Some(
+                std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ),
+            username: "root".into(),
+            password: String::new(),
+            database: String::new(),
+            file_path: String::new(),
+        };
+        let session =
+            Arc::new(async_std::task::block_on(crate::database::connect(&config)).unwrap());
+        let observer = async_std::task::block_on(crate::database::connect(&config)).unwrap();
+        let thread_id = async_std::task::block_on(async {
+            session
+                .run_sql("mysql", "SET @queued_ui_runs = 0, @preserved_ui = 42")
+                .await
+                .unwrap();
+            session
+                .run_sql("mysql", "SELECT CONNECTION_ID()")
+                .await
+                .unwrap()
+                .0
+                .rows[0][0]
+                .clone()
+                .unwrap()
+        });
+        let request = OpenTable {
+            session: session.clone(),
+            connection_name: "Cancel UI".into(),
+            database: "mysql".into(),
+            table: "".into(),
+        };
+        cx.update(gpui_kit::init);
+        cx.update(SqlEditor::isolate_test_history);
+        let mut app = None;
+        let handle = cx.open_window(size(px(1250.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| crate::AppView::new(None, None, None, window, cx));
+            view.update(cx, |view, cx| {
+                view.open_sql_draft(request.clone(), Some("SELECT SLEEP(30)".into()), window, cx);
+                view.open_sql_draft(
+                    request.clone(),
+                    Some("SET @queued_ui_runs = @queued_ui_runs + 1".into()),
+                    window,
+                    cx,
+                );
+                view.select_tab(0, window, cx);
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let (first, queued) = cx.update(|cx| {
+            let crate::WorkspaceTab::Sql(first, _) = &app.read(cx).tabs[0] else {
+                panic!("SQL missing")
+            };
+            let crate::WorkspaceTab::Sql(queued, _) = &app.read(cx).tabs[1] else {
+                panic!("SQL missing")
+            };
+            (first.clone(), queued.clone())
+        });
+        let timeout = Duration::from_secs(10);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        async_std::task::block_on(async_std::future::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = observer.run_sql("mysql", &format!("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = {thread_id} AND INFO LIKE '%SLEEP(30)%' AND COMMAND = 'Query'")).await.unwrap().0;
+                if rows.rows[0][0].as_deref() == Some("1") { break; }
+                async_std::task::sleep(Duration::from_millis(10)).await;
+            }
+        })).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.within("workspace-tabs").click(1_usize, cx);
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(first.read(cx).is_busy());
+            assert!(queued.read(cx).is_busy());
+            // Quit checks inactive tabs as well as the queued active execution.
+            app.update(cx, |app, cx| assert!(!app.prepare_close(false, window, cx)));
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("cancel-sql", cx);
+            assert!(queued.read(cx).cancelling);
+            window.click("cancel-sql", cx);
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.wait_for(handle.into(), timeout, |_, cx| !queued.read(cx).is_busy())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(first.read(cx).is_running());
+            assert!(
+                queued
+                    .read(cx)
+                    .status
+                    .starts_with("SQL cancelled before execution")
+            );
+            assert!(!queued.read(cx).failed);
+            assert!(queued.read(cx).export.is_none());
+            assert!(queued.read(cx).results.is_none());
+            assert_eq!(
+                queued.read(cx).input.read(cx).value().as_ref(),
+                "SET @queued_ui_runs = @queued_ui_runs + 1"
+            );
+            window.within("workspace-tabs").click(0_usize, cx);
+            window.input("changed", cx);
+            assert_eq!(
+                first.read(cx).input.read(cx).value().as_ref(),
+                "SELECT SLEEP(30)"
+            );
+            window.press("cmd-.", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.wait_for(handle.into(), timeout, |_, cx| !first.read(cx).is_busy())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(first.read(cx).status.starts_with("SQL cancelled"));
+            assert!(!first.read(cx).failed);
+            assert!(first.read(cx).export.is_none());
+            assert!(first.read(cx).results.is_none());
+            assert!(window.try_find("cancel-sql").is_none());
+            assert_eq!(
+                first.read(cx).input.read(cx).value().as_ref(),
+                "SELECT SLEEP(30)"
+            );
+            let history = cx
+                .global::<super::History>()
+                .entries("Cancel UI", "mysql")
+                .collect::<Vec<_>>();
+            assert_eq!(history.len(), 2);
+            assert!(
+                history
+                    .iter()
+                    .all(|entry| !entry.failed && entry.status.starts_with("SQL cancelled"))
+            );
+            first.update(cx, |editor, cx| {
+                editor.set_sql(
+                    "SELECT @preserved_ui, @queued_ui_runs, CONNECTION_ID()".into(),
+                    window,
+                    cx,
+                )
+            });
+            window.click("run-sql", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.wait_for(handle.into(), timeout, |_, cx| !first.read(cx).is_busy())
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!first.read(cx).failed, "{}", first.read(cx).status);
+            let values = &first
+                .read(cx)
+                .results
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .delegate()
+                .data
+                .rows[0];
+            assert_eq!(
+                values,
+                &[Some("42".into()), Some("0".into()), Some(thread_id.clone())]
+            );
+            assert!(first.read(cx).export.is_some());
+            window.press("ctrl-.", cx);
+            assert!(!first.read(cx).is_busy());
+            first.update(cx, |editor, cx| {
+                editor.set_sql("SELECT SLEEP(30)".into(), window, cx)
+            });
+            window.click("run-sql", cx);
+            window.press("ctrl-.", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.wait_for(handle.into(), timeout, |_, cx| !first.read(cx).is_busy())
+            .await;
+        cx.update(|cx| {
+            assert!(first.read(cx).status.starts_with("SQL cancelled"));
+            assert!(!first.read(cx).failed);
+            assert!(first.read(cx).export.is_none());
+        });
+        async_std::task::block_on(session.check_health());
+        assert!(session.is_connected());
     }
 }

@@ -1,5 +1,6 @@
 mod import;
 mod row_operations;
+use row_operations::bulk_checkbox_id;
 
 use crate::{
     connections::OpenTable,
@@ -25,6 +26,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
+use std::collections::BTreeMap;
 
 struct Rows {
     columns: Vec<Column>,
@@ -34,12 +36,21 @@ struct Rows {
 
 impl TableDelegate for Rows {
     fn columns_count(&self, _: &App) -> usize {
-        self.columns.len()
+        self.columns.len() + usize::from(!self.data.schema.primary_key.is_empty())
     }
     fn rows_count(&self, _: &App) -> usize {
         self.data.rows.len()
     }
-    fn column(&self, ix: usize, _: &App) -> Column {
+    fn column(&self, ix: usize, cx: &App) -> Column {
+        if !self.data.schema.primary_key.is_empty() {
+            if ix == 0 {
+                return Column::new("\0bulk-selection", "Select")
+                    .width(cx.theme().font_size * 4.)
+                    .movable(false)
+                    .resizable(false);
+            }
+            return self.columns[ix - 1].clone();
+        }
         self.columns[ix].clone()
     }
 
@@ -49,6 +60,22 @@ impl TableDelegate for Rows {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let col_ix = if !self.data.schema.primary_key.is_empty() {
+            if col_ix == 0 {
+                return div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .px_1p5()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Select")
+                    .into_any_element();
+            }
+            col_ix - 1
+        } else {
+            col_ix
+        };
         let column = &self.columns[col_ix];
         let kind = &self.data.schema.column_types[col_ix];
         let label = format!("{} · {}", column.name, kind);
@@ -133,6 +160,7 @@ impl TableDelegate for Rows {
                             .child(kind.clone()),
                     ),
             )
+            .into_any_element()
     }
 
     fn render_td(
@@ -142,6 +170,44 @@ impl TableDelegate for Rows {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let col_ix = if !self.data.schema.primary_key.is_empty() {
+            if col_ix == 0 {
+                let key = self.data.keys[row_ix].clone();
+                let owner = self.owner.upgrade().expect("table owner exists");
+                let view = owner.read(cx);
+                let checked = view.bulk_rows.contains_key(&key);
+                let disabled = view.is_busy()
+                    || view.is_dirty(cx)
+                    || view.filter_pending
+                    || view
+                        .request
+                        .as_ref()
+                        .is_none_or(|request| !request.session.is_connected());
+                return div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .px_1p5()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Checkbox::new(bulk_checkbox_id(&key))
+                            .small()
+                            .accessibility_label(format!("Select row {:?} for deletion", key))
+                            .checked(checked)
+                            .disabled(disabled)
+                            .on_click(move |checked, window, cx| {
+                                cx.stop_propagation();
+                                owner.update(cx, |view, cx| {
+                                    view.toggle_bulk_row(key.clone(), *checked, window, cx)
+                                });
+                            }),
+                    )
+                    .into_any_element();
+            }
+            col_ix - 1
+        } else {
+            col_ix
+        };
         let value = &self.data.rows[row_ix][col_ix];
         div()
             .truncate()
@@ -155,6 +221,7 @@ impl TableDelegate for Rows {
                 cell.text_color(cx.theme().muted_foreground)
             })
             .child(value.clone().unwrap_or_else(|| "NULL".into()))
+            .into_any_element()
     }
 
     fn render_empty(
@@ -223,6 +290,10 @@ pub(crate) struct TableView {
     exporting: bool,
     export_status: Option<String>,
     export_failed: bool,
+    // ponytail: selected full rows live in memory; use disk snapshots if large selections need bounded memory.
+    bulk_rows: BTreeMap<Vec<Option<String>>, Vec<Option<String>>>,
+    bulk_generation: u64,
+    bulk_error: Option<String>,
 }
 
 pub(crate) struct QueryChanged;
@@ -295,6 +366,7 @@ impl TableView {
     }
 
     pub(crate) fn detach(&mut self, cx: &mut Context<Self>) {
+        self.clear_bulk_selection(cx);
         self.request = None;
         self.table = None;
         self.fields.clear();
@@ -353,6 +425,7 @@ impl TableView {
         self.filter_task = None;
         self.filter_pending = false;
         self.loading = true;
+        self.bulk_generation += 1;
         self.error = None;
         self.fields.clear();
         self.selected_row = None;
@@ -476,6 +549,13 @@ impl TableView {
         self.load_generation += 1;
         match result {
             Ok(data) => {
+                if self
+                    .table
+                    .as_ref()
+                    .is_some_and(|table| table.read(cx).delegate().data.schema != data.schema)
+                {
+                    self.clear_bulk_selection(cx);
+                }
                 if self.filter_column.is_none() {
                     let column = cx.new(|cx| {
                         SelectState::new(
@@ -1126,6 +1206,10 @@ impl Render for TableView {
             Some(error.clone())
         } else if self.table.is_none() {
             Some("Loading table…".to_owned())
+        } else if self.saving && !self.bulk_rows.is_empty() {
+            Some("Changing rows…".to_owned())
+        } else if self.row_reads > 0 {
+            Some("Loading row values…".to_owned())
         } else {
             None
         };
@@ -1319,6 +1403,23 @@ impl Render for TableView {
                     .aria_label(status.clone()).px_3().py_2().text_sm()
                     .text_color(if self.export_failed { cx.theme().danger } else { cx.theme().muted_foreground })
                     .child(status.clone()))
+            })
+            .when_some(self.bulk_error.as_ref(), |view, error| {
+                view.child(div().id("bulk-error").test_support().role(Role::Status)
+                    .aria_label(error.clone()).px_3().py_2().text_sm().text_color(cx.theme().danger)
+                    .child(error.clone()))
+            })
+            .when(!self.bulk_rows.is_empty(), |view| {
+                view.child(div().flex().flex_wrap().items_center().gap_2().px_3().py_2()
+                    .child(div().id("bulk-status").test_support().role(Role::Status)
+                        .aria_label(format!("{} rows selected across pages and filters", self.bulk_rows.len()))
+                        .text_sm().child(format!("{} rows selected across pages and filters", self.bulk_rows.len())))
+                    .child(Button::new("delete-selected-rows").small().danger().label("Delete selected…")
+                        .disabled(!self.is_bulk_selectable(cx))
+                        .on_click(cx.listener(|view, _, window, cx| view.confirm_bulk_delete(window, cx))))
+                    .child(Button::new("clear-row-selection").small().ghost().label("Clear selection")
+                        .disabled(self.is_busy())
+                        .on_click(cx.listener(|view, _, _, cx| { if !view.is_busy() { view.clear_bulk_selection(cx); } }))))
             })
             .when_some(self.table.as_ref(), |view, table| {
                 view.child(
@@ -1630,6 +1731,7 @@ mod tests {
     async fn mariadb_connection_lifecycle_preserves_drafts_guards_work_and_refreshes_metadata(
         cx: &mut TestAppContext,
     ) {
+        cx.background_executor.allow_parking();
         use crate::{
             database::{FilterOperator, TableFilter, TableQuery},
             settings::{Connection, DatabaseKind, Settings},
@@ -2572,7 +2674,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.click_at(
                 ("row", 0_usize),
-                point(window.rem_size(), Size::Small.table_row_height() / 2.),
+                point(window.rem_size() * 5., Size::Small.table_row_height() / 2.),
                 cx,
             );
         })
@@ -2612,7 +2714,7 @@ mod tests {
             );
             window.click_at(
                 ("row", 1_usize),
-                point(window.rem_size(), Size::Small.table_row_height() / 2.),
+                point(window.rem_size() * 5., Size::Small.table_row_height() / 2.),
                 cx,
             );
         })

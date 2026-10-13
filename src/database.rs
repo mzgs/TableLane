@@ -1,5 +1,7 @@
 mod row_operations;
 pub(crate) use row_operations::RowChange;
+mod cancellation;
+pub(crate) use cancellation::QueryCancellation;
 
 use crate::{
     data_export::{ExportFormat, ExportWriter, QueryExport},
@@ -187,6 +189,8 @@ impl TableQuery {
 
 pub(crate) struct Session {
     connection_key: String,
+    options: sqlx::mysql::MySqlConnectOptions,
+    thread_id: u64,
     connection: async_std::sync::Mutex<Option<MySqlConnection>>,
     databases: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
     error: std::sync::RwLock<Option<String>>,
@@ -532,24 +536,36 @@ impl Session {
         database: &str,
         sql: &str,
     ) -> Result<(TableRows, u64), String> {
-        self.run_sql_capture(database, sql, None).await
+        self.run_sql_capture(database, sql, None, None).await
     }
 
     pub(crate) async fn run_sql_export(
         &self,
         database: &str,
         sql: &str,
+        cancellation: &QueryCancellation,
     ) -> Result<(TableRows, u64, QueryExport), String> {
-        let mut export = QueryExport::new().map_err(|error| {
-            format!("Couldn’t prepare result export: {error}. SQL was not executed.")
-        })?;
-        let (data, affected) = self
-            .run_sql_capture(database, sql, Some(&mut export))
-            .await?;
-        export
-            .finish()
-            .map_err(|error| format!("SQL completed, but saving full results failed: {error}."))?;
-        Ok((data, affected, export))
+        let result = async {
+            let mut export = QueryExport::new().map_err(|error| {
+                format!("Couldn’t prepare result export: {error}. SQL was not executed.")
+            })?;
+            let (data, affected) = self
+                .run_sql_capture(database, sql, Some(&mut export), Some(cancellation))
+                .await?;
+            export.finish().map_err(|error| {
+                format!("SQL completed, but saving full results failed: {error}.")
+            })?;
+            Ok((data, affected, export))
+        }
+        .await;
+        if let Some(status) = cancellation.finish(self).await {
+            return Err(status);
+        }
+        if result.is_ok() && cancellation.is_requested() {
+            cancellation.discard_completed();
+            return Err("SQL finished after cancellation was requested. Results were discarded; check writes before retrying.".into());
+        }
+        result
     }
 
     async fn run_sql_capture(
@@ -557,19 +573,34 @@ impl Session {
         database: &str,
         sql: &str,
         mut capture: Option<&mut QueryExport>,
+        cancellation: Option<&QueryCancellation>,
     ) -> Result<(TableRows, u64), String> {
         use async_std::stream::StreamExt;
         if sql.trim().is_empty() {
             return Err("Enter a SQL statement to run.".into());
         }
         let result = async {
-            let mut guard = self.connection().await?;
+            let mut guard = self.query_connection(cancellation).await?;
             let connection = guard.as_mut().unwrap();
-            sqlx::query(&format!("USE {}", quote_identifier(database)))
-                .execute(&mut *connection)
-                .await?;
+            if let Some(cancellation) = cancellation {
+                cancellation.check_before_execution()?;
+            }
+            let tagged_sql = cancellation.map(|cancellation| cancellation.tagged_sql(sql));
+            let use_database = format!("USE {}", quote_identifier(database));
+            let use_database = cancellation.map_or(use_database.clone(), |cancellation| {
+                cancellation.tagged_sql(&use_database)
+            });
+            sqlx::query(&use_database).execute(&mut *connection).await?;
+            if let Some(cancellation) = cancellation {
+                cancellation.check_before_execution()?;
+            }
             // Preparing validates a single statement without executing it.
-            let description = connection.describe(sql).await?;
+            let description = connection
+                .describe(tagged_sql.as_deref().unwrap_or(sql))
+                .await?;
+            if let Some(cancellation) = cancellation {
+                cancellation.check_before_execution()?;
+            }
             let schema = TableSchema {
                 columns: description
                     .columns()
@@ -596,8 +627,14 @@ impl Session {
             let mut affected = 0;
             // shortcut: only the first result set is displayed; add a result selector when needed for stored procedures.
             let mut first_result = true;
-            let mut stream = sqlx::raw_sql(sql).fetch_many(&mut *connection);
+            let mut stream =
+                sqlx::raw_sql(tagged_sql.as_deref().unwrap_or(sql)).fetch_many(&mut *connection);
             while let Some(item) = stream.next().await {
+                if cancellation.is_some_and(QueryCancellation::is_requested) {
+                    // Consume the protocol response without retaining partial results.
+                    item?;
+                    continue;
+                }
                 match item? {
                     sqlx::Either::Left(result) => {
                         affected += result.rows_affected();
@@ -639,6 +676,11 @@ impl Session {
                     _ => {}
                 }
             }
+            drop(stream);
+            if cancellation.is_some_and(QueryCancellation::is_requested) {
+                // Keep the shared mutex until SQLx has consumed the terminal response.
+                connection.flush().await?;
+            }
             // Drain the stream even if the disk fills, leaving the shared session usable.
             if let Some(error) = capture_error {
                 return Err(sqlx::Error::Protocol(format!(
@@ -648,7 +690,12 @@ impl Session {
             Ok::<_, sqlx::Error>((data, affected))
         }
         .await;
-        result.map_err(|error| format!("Couldn’t run SQL: {}", self.database_error(error)))
+        result.map_err(|error| {
+            if let Some(cancellation) = cancellation {
+                cancellation.mark_interrupted(&error);
+            }
+            format!("Couldn’t run SQL: {}", self.database_error(error))
+        })
     }
 
     pub(crate) async fn read_table(
@@ -1155,10 +1202,16 @@ async fn read_databases(
 pub(crate) async fn connect(connection: &Connection) -> Result<Session, String> {
     let url = connection_url(connection)?;
     async_std::future::timeout(std::time::Duration::from_secs(15), async {
-        let mut session = MySqlConnection::connect(url.as_str()).await?;
+        let options = url.as_str().parse::<sqlx::mysql::MySqlConnectOptions>()?;
+        let mut session = MySqlConnection::connect_with(&options).await?;
+        let thread_id = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut session)
+            .await?;
         let databases = read_databases(&mut session).await?;
         Ok::<_, sqlx::Error>(Session {
             connection_key: connection.key(),
+            options,
+            thread_id,
             connection: async_std::sync::Mutex::new(Some(session)),
             databases: std::sync::RwLock::new(databases),
             error: std::sync::RwLock::new(None),
