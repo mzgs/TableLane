@@ -13,6 +13,7 @@ pub(crate) struct QueryCancellation {
     finished: AtomicBool,
     interrupted: AtomicBool,
     discarded: AtomicBool,
+    started: AtomicBool,
     gate: async_std::sync::Mutex<()>,
     signal: (
         async_std::channel::Sender<()>,
@@ -29,6 +30,7 @@ impl QueryCancellation {
             finished: AtomicBool::new(false),
             interrupted: AtomicBool::new(false),
             discarded: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             gate: async_std::sync::Mutex::new(()),
             signal: async_std::channel::bounded(1),
         }
@@ -101,13 +103,19 @@ impl QueryCancellation {
 
     pub(super) fn check_before_execution(&self) -> Result<(), sqlx::Error> {
         if self.is_requested() {
-            self.discarded.store(true, SeqCst);
+            if !self.started.load(SeqCst) {
+                self.discarded.store(true, SeqCst);
+            }
             Err(sqlx::Error::Protocol(
                 "SQL cancelled before execution.".into(),
             ))
         } else {
             Ok(())
         }
+    }
+
+    pub(super) fn mark_started(&self) {
+        self.started.store(true, SeqCst);
     }
 
     pub(super) fn mark_interrupted(&self, error: &sqlx::Error) {
@@ -317,6 +325,43 @@ mod tests {
                 assert_eq!(result.0.rows[0][1].as_deref(), Some("123"));
             }
             session.run_sql(db, "ROLLBACK").await.unwrap();
+            // Cancel a later statement, discard earlier snapshots, and never run the remainder.
+            let cancellation = Arc::new(QueryCancellation::new());
+            let task_session = session.clone();
+            let task_control = cancellation.clone();
+            let task = async_std::task::spawn(async move {
+                task_session.run_sql_script(db, "SET @script_before = 1, @script_after = 0; SELECT 7; SELECT SLEEP(30); SET @script_after = 1;", &task_control).await
+            });
+            let mut observer = MySqlConnection::connect_with(&session.options)
+                .await
+                .unwrap();
+            async_std::future::timeout(Duration::from_secs(5), async {
+                loop {
+                    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID = ? AND INFO LIKE '%SLEEP(30)%' AND COMMAND = 'Query'")
+                        .bind(session.thread_id).fetch_one(&mut observer).await.unwrap();
+                    if running != 0 { break; }
+                    async_std::task::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            cancellation.cancel(&session).await.unwrap();
+            assert!(
+                async_std::future::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .err()
+                    .unwrap()
+                    .starts_with("SQL cancelled")
+            );
+            assert!(cancellation.is_result_discarded());
+            assert_eq!(
+                session
+                    .run_sql(db, "SELECT @script_before, @script_after")
+                    .await
+                    .unwrap()
+                    .0
+                    .rows[0],
+                [Some("1".into()), Some("0".into())]
+            );
             assert_eq!(
                 session
                     .run_sql(db, "SELECT COUNT(*) FROM widgets")

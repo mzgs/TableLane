@@ -1,7 +1,7 @@
 use crate::{
     connections::OpenTable,
     data_export::{ExportFormat, QueryExport},
-    database::{QueryCancellation, TableRows},
+    database::{QueryCancellation, SqlResult, TableRows},
     workspace_state::SqlDraft,
 };
 mod history;
@@ -12,6 +12,7 @@ use gpui_kit::{
         clipboard::Clipboard,
         input::{CompletionProvider, Editor, EditorState, InputEvent, Rope, RopeExt},
         list::{List, ListDelegate, ListEvent, ListItem, ListState},
+        select::{Select, SelectEvent, SelectState},
         table::{Column, DataTable, TableDelegate, TableState},
         text::{SelectionFormat, TextView},
     },
@@ -204,11 +205,20 @@ pub(crate) struct DraftChanged;
 
 impl EventEmitter<DraftChanged> for SqlEditor {}
 
+struct CompletedResult {
+    table: Option<Entity<TableState<Results>>>,
+    export: Option<std::sync::Arc<QueryExport>>,
+    summary: String,
+}
+
 pub(crate) struct SqlEditor {
     request: Option<OpenTable>,
     draft: SqlDraft,
     input: Entity<EditorState>,
     results: Option<Entity<TableState<Results>>>,
+    result_sets: Vec<CompletedResult>,
+    result_selector: Option<Entity<SelectState<Vec<String>>>>,
+    selected_result: usize,
     running: bool,
     cancellation: Option<std::sync::Arc<QueryCancellation>>,
     cancelling: bool,
@@ -254,7 +264,7 @@ impl SqlEditor {
         let input = cx.new(|cx| {
             let mut input = EditorState::new(window, cx)
                 .language("sql")
-                .placeholder("Enter one SQL statement");
+                .placeholder("Enter SQL statements separated by semicolons");
             input.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
                 tables: request
                     .as_ref()
@@ -279,11 +289,14 @@ impl SqlEditor {
             draft,
             input,
             results: None,
+            result_sets: Vec::new(),
+            result_selector: None,
+            selected_result: 0,
             running: false,
             cancellation: None,
             cancelling: false,
             cancel_error: None,
-            status: "Run a statement to see its results".into(),
+            status: "Run SQL to see its results".into(),
             failed: false,
             export: None,
             exporting: false,
@@ -409,6 +422,8 @@ impl SqlEditor {
         self.failed = false;
         self.status = "Running SQL…".into();
         self.results = None;
+        self.result_sets.clear();
+        self.result_selector = None;
         self.export = None;
         self.export_status = None;
         let Some(request) = self.request.clone() else {
@@ -420,7 +435,7 @@ impl SqlEditor {
                 let start = std::time::Instant::now();
                 let result = request
                     .session
-                    .run_sql_export(&request.database, &sql, &cancellation)
+                    .run_sql_script(&request.database, &sql, &cancellation)
                     .await;
                 (result, start.elapsed(), cancellation.is_result_discarded())
             })
@@ -435,37 +450,23 @@ impl SqlEditor {
                     editor.cancel_error = None;
                 }
                 match result {
-                    Ok((data, affected, export)) => {
-                        editor.status = format!(
-                            "{} rows{} · {affected} rows affected · {:.2} s",
-                            export.row_count(),
-                            if data.has_more {
-                                " (first 1,000 shown)"
-                            } else {
-                                ""
-                            },
-                            elapsed.as_secs_f64()
-                        );
-                        if !data.schema.columns.is_empty() {
-                            editor.export = Some(std::sync::Arc::new(export));
-                            let columns = data
-                                .schema
-                                .columns
-                                .iter()
-                                .enumerate()
-                                .map(|(ix, name)| {
-                                    Column::new(format!("sql-column-{ix}"), name.clone())
-                                        .width(rems(12.).to_pixels(window.rem_size()))
-                                        .movable(false)
-                                })
-                                .collect();
-                            editor.results = Some(cx.new(|cx| {
-                                TableState::new(Results { columns, data }, window, cx)
-                                    .col_movable(false)
-                                    .cell_selectable(true)
-                                    .row_header(false)
-                            }));
-                        }
+                    Ok(run) => {
+                        let affected: u64 = run.results.iter().map(|result| result.affected).sum();
+                        editor.set_results(run.results, window, cx);
+                        editor.failed = run.error.is_some();
+                        editor.status = if let Some(error) = run.error {
+                            let count = editor.result_sets.len();
+                            let retained = match count {
+                                0 => String::new(),
+                                1 => " 1 completed result remains available.".into(),
+                                _ => format!(" {count} completed results remain available."),
+                            };
+                            format!("{error} Script stopped. Statements may have changed data; there is no automatic rollback.{retained}")
+                        } else if editor.result_sets.len() == 1 {
+                            format!("{} · {:.2} s", editor.result_sets[0].summary, elapsed.as_secs_f64())
+                        } else {
+                            format!("{} results · {affected} rows affected · {:.2} s", editor.result_sets.len(), elapsed.as_secs_f64())
+                        };
                     }
                     Err(error) => {
                         editor.status = error;
@@ -484,6 +485,108 @@ impl SqlEditor {
         })
         .detach();
         cx.notify();
+    }
+
+    fn set_results(
+        &mut self,
+        results: Vec<SqlResult>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_sets = results
+            .into_iter()
+            .map(|result| {
+                let SqlResult {
+                    data,
+                    affected,
+                    export,
+                } = result;
+                let summary = if data.schema.columns.is_empty() {
+                    format!("{affected} rows affected · No row data returned")
+                } else {
+                    format!(
+                        "{} rows{} · {affected} rows affected",
+                        export
+                            .as_ref()
+                            .map_or(data.rows.len(), |export| export.row_count()),
+                        if data.has_more {
+                            " (first 1,000 shown)"
+                        } else {
+                            ""
+                        }
+                    )
+                };
+                let (table, export) = if data.schema.columns.is_empty() {
+                    (None, None)
+                } else {
+                    let columns = data
+                        .schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, name)| {
+                            Column::new(format!("sql-column-{ix}"), name.clone())
+                                .width(rems(12.).to_pixels(window.rem_size()))
+                                .movable(false)
+                        })
+                        .collect();
+                    (
+                        Some(cx.new(|cx| {
+                            TableState::new(Results { columns, data }, window, cx)
+                                .col_movable(false)
+                                .cell_selectable(true)
+                                .row_header(false)
+                        })),
+                        export,
+                    )
+                };
+                CompletedResult {
+                    table,
+                    export,
+                    summary,
+                }
+            })
+            .collect();
+        let selected = self
+            .result_sets
+            .iter()
+            .position(|result| result.table.is_some())
+            .unwrap_or(0);
+        self.select_result(selected, cx);
+        if self.result_sets.len() > 1 {
+            let choices = self
+                .result_sets
+                .iter()
+                .enumerate()
+                .map(|(ix, result)| format!("Result {} · {}", ix + 1, result.summary))
+                .collect::<Vec<_>>();
+            let selector =
+                cx.new(|cx| SelectState::new(choices, Some(IndexPath::new(selected)), window, cx));
+            cx.subscribe_in(
+                &selector,
+                window,
+                |editor, selector, _: &SelectEvent<Vec<String>>, _, cx| {
+                    if let Some(ix) = selector.read(cx).selected_index(cx) {
+                        editor.select_result(ix.row, cx);
+                    }
+                },
+            )
+            .detach();
+            self.result_selector = Some(selector);
+        }
+    }
+
+    fn select_result(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+        if let Some(result) = self.result_sets.get(ix) {
+            self.selected_result = ix;
+            self.results = result.table.clone();
+            self.export = result.export.clone();
+            self.export_status = None;
+            cx.notify();
+        }
     }
 
     pub(crate) fn cancel_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -756,7 +859,7 @@ impl Render for SqlEditor {
             .child(
                 div().id("sql-input").p_3().flex_shrink_0().child(
                     Editor::new(&self.input)
-                        .aria_label("SQL statement")
+                        .aria_label("SQL script")
                         .h(rems(10.))
                         .readonly(self.running),
                 ),
@@ -774,7 +877,7 @@ impl Render for SqlEditor {
                         Button::new("run-sql")
                             .small()
                             .label("Run")
-                            .tooltip("Run selected SQL, or the whole statement (Cmd/Ctrl+Enter)")
+                            .tooltip("Run selected SQL, or the whole script (Cmd/Ctrl+Enter)")
                             .loading(self.running)
                             .disabled(self.is_busy() || self.request.as_ref().is_none_or(|request| !request.session.is_connected()) || self.input.read(cx).value().trim().is_empty())
                             .on_click(cx.listener(|editor, _, window, cx| editor.run(window, cx))),
@@ -877,6 +980,12 @@ impl Render for SqlEditor {
                     .aria_label(error.clone()).px_3().pb_2().text_sm().text_color(cx.theme().danger)
                     .child(error.clone()))
             })
+            .when_some(self.result_selector.as_ref(), |view, selector| {
+                view.child(div().px_3().pb_2().flex_shrink_0().min_w_0().child(
+                    Select::new(selector).id("sql-result-selector").small()
+                        .accessibility_label("Result set").w_full().disabled(self.is_busy())
+                ))
+            })
             .when_some(self.results.as_ref(), |view, results| {
                 view.child(
                     div()
@@ -910,6 +1019,211 @@ mod tests {
         let start = sql.find("SELECT 2").unwrap();
         assert_eq!(super::selected_sql(sql, start..sql.len()), "SELECT 2");
         assert_eq!(super::selected_sql(sql, 7..15), "'世界'");
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires an isolated MariaDB server and TABLELANE_TEST_MARIADB_PORT"]
+    async fn mariadb_sql_scripts_select_and_export_completed_results_through_ui(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        let session = std::sync::Arc::new(
+            async_std::task::block_on(crate::database::connect(&Connection {
+                name: "Script UI".into(),
+                database_type: DatabaseKind::MariaDB,
+                host: "127.0.0.1".into(),
+                port: Some(
+                    std::env::var("TABLELANE_TEST_MARIADB_PORT")
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                ),
+                username: "root".into(),
+                password: String::new(),
+                database: String::new(),
+                file_path: String::new(),
+            }))
+            .unwrap(),
+        );
+        cx.update(gpui_kit::init);
+        cx.update(|cx| cx.set_global(super::History::for_test()));
+        let mut editor = None;
+        let handle = cx.open_window(size(px(1100.), px(750.)), |window, cx| {
+            let view = cx.new(|cx| {
+                SqlEditor::new(
+                    OpenTable {
+                        session: session.clone(),
+                        connection_name: "Script UI".into(),
+                        database: "mysql".into(),
+                        table: String::new(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            editor = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let timeout = std::time::Duration::from_secs(15);
+        let script = "SET @script_ui_runs = COALESCE(@script_ui_runs, 0) + 1; SELECT 11 AS first_result; SELECT seq, REPEAT('世界', 300) AS body FROM seq_1_to_1005; SELECT 1 AS empty_result WHERE FALSE;";
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.input(script, cx);
+            window.press("cmd-enter", cx);
+            assert!(editor.read(cx).running);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).running)
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(!editor.read(cx).failed, "{}", editor.read(cx).status);
+            assert_eq!(editor.read(cx).result_sets.len(), 4);
+            assert_eq!(editor.read(cx).selected_result, 1);
+            assert_eq!(
+                editor
+                    .read(cx)
+                    .results
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows[0][0]
+                    .as_deref(),
+                Some("11")
+            );
+            window.render_frame(cx);
+            window.click("sql-result-selector", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(editor.read(cx).selected_result, 2);
+            assert_eq!(editor.read(cx).export.as_ref().unwrap().row_count(), 1005);
+            assert_eq!(
+                editor
+                    .read(cx)
+                    .results
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .rows
+                    .len(),
+                1000
+            );
+            window.click("export-sql-json", cx);
+            window.click("sql-result-selector", cx);
+            assert!(editor.read(cx).exporting);
+            assert_eq!(editor.read(cx).selected_result, 2);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (file, output) = crate::data_export::TemporaryFile::new(&std::env::temp_dir()).unwrap();
+        drop(output);
+        cx.simulate_new_path_selection(|_| Some(file.path().to_owned()));
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).exporting)
+            .await;
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), 1005);
+        assert_eq!(json["rows"][1004][1], "世界".repeat(300));
+        assert_eq!(
+            async_std::task::block_on(session.run_sql("mysql", "SELECT @script_ui_runs"))
+                .unwrap()
+                .0
+                .rows[0][0]
+                .as_deref(),
+            Some("1")
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("sql-result-selector", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(editor.read(cx).selected_result, 3);
+            assert_eq!(editor.read(cx).export.as_ref().unwrap().row_count(), 0);
+            assert_eq!(
+                editor
+                    .read(cx)
+                    .results
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .data
+                    .schema
+                    .columns,
+                ["empty_result"]
+            );
+            // Select a write completion: no export or stale table from the previous result.
+            window.click("sql-result-selector", cx);
+            window.press("up", cx);
+            window.press("up", cx);
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(editor.read(cx).selected_result, 0);
+            assert!(editor.read(cx).export.is_none());
+            assert!(editor.read(cx).results.is_none());
+            window.click("export-sql-json", cx);
+            assert!(!editor.read(cx).exporting);
+            window.click(("input", editor.read(cx).input.entity_id()), cx);
+            window.press("secondary-a", cx);
+            window.input(
+                "SELECT 42; SELECT * FROM tablelane_script_missing; SET @script_ui_runs = 99",
+                cx,
+            );
+            window.click("run-sql", cx);
+            assert!(editor.read(cx).result_sets.is_empty());
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), timeout, |_, cx| !editor.read(cx).running)
+            .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = editor.read(cx);
+            assert!(view.failed);
+            assert!(view.status.contains("Script stopped"));
+            assert_eq!(view.result_sets.len(), 1);
+            assert_eq!(
+                view.results.as_ref().unwrap().read(cx).delegate().data.rows[0][0].as_deref(),
+                Some("42")
+            );
+            assert!(view.export.is_some());
+            assert!(view.result_selector.is_none());
+            let history = cx.global::<super::History>();
+            let entries: Vec<_> = history.entries("Script UI", "mysql").collect();
+            assert_eq!(entries.len(), 2);
+            assert!(entries[0].failed);
+            assert_eq!(entries[1].sql, script);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("sql-status")
+                    .label()
+                    .unwrap()
+                    .contains("1 completed result")
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            async_std::task::block_on(session.run_sql("mysql", "SELECT @script_ui_runs"))
+                .unwrap()
+                .0
+                .rows[0][0]
+                .as_deref(),
+            Some("1")
+        );
     }
 
     #[gpui_kit::test]

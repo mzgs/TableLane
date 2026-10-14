@@ -29,7 +29,7 @@ protection against unsaved edits and concurrent database changes.
 - [x] Query cancellation without leaving a busy/broken shared session
 - [ ] SQL workflow
   - [x] Run selected SQL
-  - [ ] Multi-statement scripts and multiple result sets
+  - [x] Multi-statement scripts and multiple result sets
   - [ ] Saved queries
   - [ ] Browse/export results beyond 1,000 rows (export complete; browsing still capped)
 - [ ] Connection security: SSH tunneling and configurable TLS certificates
@@ -449,10 +449,60 @@ protection against unsaved edits and concurrent database changes.
   stay active until that execution actually finishes.
 - README updated; no dependencies, credential-storage changes, or commit added.
 
+### 2026-10-13 — SQL scripts and multiple results
+
+- SQL editors now run the selection or whole draft as a script, executing
+  statements in order under one shared-session lock. Semicolons inside strings,
+  identifiers, and comments are preserved; parsing follows the current SQL mode,
+  including changes made by earlier statements. DELIMITER lines support routine
+  definitions and compound blocks without sending client directives to MariaDB.
+- Capture every completed result set and write completion, including multiple
+  outputs from stored procedures. Each row set has its own full-value snapshot
+  and bounded 1,000-row preview. The Result selector starts on the first set
+  with columns; pointer/keyboard switching reuses retained results. CSV/JSON
+  export uses only the selected set without executing SQL again. Write summaries
+  disable export; switching and rerunning are blocked during an active export.
+- Stop at the first parse, database, or result-storage error. Completed earlier
+  sets remain available, partial failing sets are discarded, and history records
+  the original executed script once with its overall outcome. Scripts never add
+  implicit transactions or commit/rollback existing work. Errors explain that
+  earlier statements may have changed data.
+- Cancellation targets each current statement with the existing run marker and
+  exact query ID, drains its response, and prevents later statements from
+  executing. All snapshots from a cancelled run are discarded. Distinguish
+  queued cancellation from scripts that already executed SQL, including failed
+  control authentication and late requests. Existing busy/lifecycle guards stay
+  active across the whole script and pending cancellation request.
+- Standalone empty SELECTs retain their columns and support empty exports.
+  The pinned SQLx driver exposes no column metadata for empty result sets inside
+  procedures; these show a no-row-data summary and cannot be exported. Preview
+  memory grows with the number of results (up to 1,000 rows per set); full
+  snapshots still require local disk space. These limits are documented in README.
+- Verification:
+  - Isolated MariaDB full serial regression:
+    `TABLELANE_TEST_MARIADB_PORT=<port> cargo test --locked -- --include-ignored --skip csv_streaming_16_gib --test-threads=1`:
+    61 passed, including all 27 live MariaDB tests and debug startup.
+  - New database/parser coverage checks quoting/comments/Unicode, custom
+    delimiters, changing SQL modes, procedure outputs, 1,005-row full snapshots,
+    empty results, late errors, existing transaction preservation, and skipping
+    later SQL after cancellation. Production UI coverage verifies keyboard
+    selection, selected-set export, empty/write results, export guards, retained
+    results after failure, exact script history, and no repeated execution.
+  - The first regression found cancellation-outcome and copied-error newline
+    regressions; both were fixed and the complete serial regression passed.
+  - Standard serial suite: 33 passed; 29 opt-in checks ignored. Final targeted
+    SQL/cancellation UI checks after copy refinements: all 5 passed.
+  - Clippy with -D warnings, formatting, and diff checks passed.
+  - Temporary server shut down; user settings and SQL history untouched.
+  - The unchanged 16 GiB parser stress test was not repeated.
+- Remaining checks: manual native-window/theme/zoom review. Saved queries and
+  browsing SQL snapshots beyond the first 1,000 rows remain unchecked above.
+- README updated; no dependencies, credential-storage changes, or commit added.
+
 ## Continuation notes
 
-- Next batch: multi-statement SQL scripts and multiple result sets, then saved
-  queries and browsing beyond 1,000 rows. Keep incomplete checkboxes visible.
+- Next batch: saved queries, then browsing beyond 1,000 rows. Keep incomplete
+  checkboxes visible.
 - The full roadmap is not complete.
 - Edited connections apply to future sessions; existing tabs retain their old
   session and label. Retained sessions remain controllable through “Previous
@@ -472,6 +522,9 @@ protection against unsaved edits and concurrent database changes.
   SQL cancellation lives in `src/database/cancellation.rs`; preserve its exact
   query targeting, queued wakeup, response draining, and transaction behavior.
   Cancellation must stop the server query, not only abandon the UI task.
+  Script execution and splitting live in `src/database/sql.rs`; keep the session
+  locked across statements, preserve current SQL-mode parsing, and skip the
+  remainder after cancellation or any error.
 - Table previews and SQL results truncate values. Table export fetches full values
   in one streaming SELECT; SQL export reads the private temporary snapshot from
   the completed execution and must never rerun the statement.
