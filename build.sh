@@ -8,8 +8,8 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 1
 fi
 
-host=$(rustup run stable rustc -vV | sed -n 's/^host: //p')
-rustup run stable cargo build --release --target "$host" --target-dir target
+host=$(rustc -vV | sed -n 's/^host: //p')
+cargo build --release --target "$host" --target-dir target
 
 bundle="target/release/$app_name.app"
 identifier="local.$(printf '%s' "$app_name" | tr '_' '-')"
